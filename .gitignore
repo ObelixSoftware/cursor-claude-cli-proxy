@@ -1,0 +1,52 @@
+# Secrets and local configuration -- never commit these.
+.env
+.env.*
+!.env.example
+*.token
+*.secret
+secrets/
+
+# Claude / Anthropic local state. Never commit or copy.
+.claude/
+.claude.json
+.credentials.json
+claude-settings.json
+
+# Cloudflare tunnel credentials and generated configuration.
+*.cloudflared.yml
+cloudflared-config.yml
+cert.pem
+*.tunnel.json
+[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-*.json
+
+# Generated LaunchAgent (contains absolute paths, may contain a token path)
+*.generated.plist
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Runtime artifacts
+logs/
+*.log
+run/
+*.pid
+
+# Debug dumps contain full request and response bodies in cleartext, including
+# any source code the editor sent. Never commit these.
+debug-dumps/
+debug_dumps/
+*.dump.json
+
+# macOS
+.DS_Store
