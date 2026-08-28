@@ -175,19 +175,19 @@ pretty <"$BODY"
 check "tool result round trip" "$CODE" 200
 
 # ---------------------------------------------------------------------------
-hr "10. Image input must be refused (HTTP 400)"
+hr "10. Image input is accepted (HTTP 200, real Claude vision call)"
 CODE=$(curl -sS -o "$BODY" -w '%{http_code}' -H "$AUTH" \
   -H 'Content-Type: application/json' \
   "$BASE_URL/v1/chat/completions" \
   -d '{
         "model": "claude-cli-sonnet",
         "messages": [{"role": "user", "content": [
-          {"type": "text", "text": "what is this"},
-          {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+          {"type": "text", "text": "Reply with exactly: IMAGE OK"},
+          {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="}}
         ]}]
       }')
 pretty <"$BODY"
-check "image input refused" "$CODE" 400
+check "image input accepted" "$CODE" 200
 
 rm -f "$BODY"
 

@@ -200,3 +200,48 @@ async def test_responses_style_body_posted_to_chat_completions(
     payload = response.json()
     assert payload["object"] == "response", "shape detection must win over the URL"
     assert payload["output_text"] == "Detected by shape."
+
+
+async def test_image_url_is_forwarded_to_claude(
+    client: httpx.AsyncClient, fake_mode, monkeypatch, tmp_path
+):
+    argv_dump = tmp_path / "argv.json"
+    prompt_dump = tmp_path / "prompt.txt"
+    monkeypatch.setenv("FAKE_CLAUDE_ARGV_DUMP", str(argv_dump))
+    monkeypatch.setenv("FAKE_CLAUDE_PROMPT_DUMP", str(prompt_dump))
+    fake_mode("message", text="A red pixel.")
+
+    body = {
+        "model": "claude-cli-sonnet",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what colour is this"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,AAAA"},
+                    },
+                ],
+            }
+        ],
+    }
+    response = await client.post("/v1/chat/completions", json=body, headers=AUTH_HEADERS)
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "A red pixel."
+
+    argv = json.loads(argv_dump.read_text())
+    assert argv[argv.index("--input-format") + 1] == "stream-json"
+
+    stdin_payload = json.loads(prompt_dump.read_text())
+    blocks = stdin_payload["message"]["content"]
+    text_blocks = [
+        block.get("text", "")
+        for block in blocks
+        if block.get("type") == "text"
+    ]
+    assert any("what colour is this" in text for text in text_blocks)
+    assert {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"},
+    } in blocks

@@ -318,14 +318,33 @@ async def test_failures_detected_before_the_stream_opens_are_http_errors(
             {
                 "role": "user",
                 "content": [
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,A"}}
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,AAAA"},
+                    }
                 ],
             }
         ],
         "stream": True,
     }
-    rejected = await client.post(
+    accepted = await client.post(
         "/v1/chat/completions", json=image, headers=AUTH_HEADERS
+    )
+    assert accepted.status_code == 200
+    assert accepted.headers["content-type"].startswith("text/event-stream")
+
+    audio = {
+        "model": "claude-cli-proxy",
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "input_audio", "input_audio": {"data": "AAAA"}}],
+            }
+        ],
+        "stream": True,
+    }
+    rejected = await client.post(
+        "/v1/chat/completions", json=audio, headers=AUTH_HEADERS
     )
     assert rejected.status_code == 400
 

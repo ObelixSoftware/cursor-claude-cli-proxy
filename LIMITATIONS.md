@@ -77,15 +77,32 @@ JSON error, as do all non-streaming requests.
 error object; a lenient one may show an empty reply instead of an error. Check
 the proxy's log or a debug dump if a streamed turn comes back blank.
 
-## 3. Text input only -- no images, audio or files
+## 3. Images are accepted; audio and files are not
 
-Message content parts of type `image_url`, `input_image`, `image`,
-`input_audio`, `audio`, `input_file`, `file` and `file_url` are rejected with
-HTTP 400 and a message naming the offending type. There is no silent dropping
-and no attempt to describe the attachment in words.
+Message content parts of type `image_url`, `input_image` and `image` are
+accepted. Data URLs (`data:image/png;base64,...` and the other Anthropic-supported
+image types) are decoded and forwarded to the Claude Code CLI as vision content
+blocks. `https://` image URLs are passed through as URL sources. Local paths,
+`file://`, `http://` and other schemes are rejected.
 
-**What it means for you:** pasting a screenshot into a chat turn will fail the
-whole request. Send text.
+Images are inlined on stdin via `--input-format stream-json`. The CLI couples
+that flag to two others: it requires `--output-format stream-json`, which under
+`--print` in turn requires `--verbose`. An image request therefore switches all
+three, and the reply is read from the terminal `result` event of the resulting
+event stream rather than from a single JSON object. Text-only requests are
+unaffected and still use `--output-format json`.
+
+The CLI's filesystem and shell tools stay denied; nothing is written into the
+user's project. Each image is capped at 5 MiB decoded, and a request may carry
+at most 20 images. The existing `CLI_PROXY_MAX_REQUEST_BYTES` limit still
+applies to the inbound JSON body.
+
+`input_audio`, `audio`, `input_file`, `file` and `file_url` parts are still
+rejected with HTTP 400 and a message naming the offending type. There is no
+silent dropping and no attempt to describe those attachments in words.
+
+**What it means for you:** pasting a screenshot into a chat turn works. Audio
+clips and generic file attachments still fail the whole request.
 
 ## 4. Cursor compatibility is not guaranteed
 

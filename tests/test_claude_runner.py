@@ -31,6 +31,7 @@ from cli_proxy.errors import (
     ClaudeUnavailableError,
     ResponseTooLargeError,
 )
+from cli_proxy.images import ImageAttachment
 from cli_proxy.schema import KIND_ERROR, KIND_MESSAGE, KIND_TOOL_CALLS
 
 PROMPT = "# CONVERSATION\n\nhello"
@@ -50,6 +51,27 @@ def test_argv_uses_required_safety_flags(runner: ClaudeRunner):
     assert argv[argv.index("--model") + 1] == "sonnet"
     assert "--json-schema" in argv
     assert "--system-prompt" in argv
+
+
+def test_argv_uses_stream_json_input_only_when_images_are_present(runner: ClaudeRunner):
+    plain = runner.build_argv("sonnet")
+    assert "--input-format" not in plain
+    assert "--verbose" not in plain
+
+    with_images = runner.build_argv("sonnet", has_images=True)
+    assert with_images[with_images.index("--input-format") + 1] == "stream-json"
+    assert "--safe-mode" in with_images
+    assert with_images[with_images.index("--tools") + 1] == STRUCTURED_OUTPUT_TOOL
+
+
+def test_argv_satisfies_the_cli_stream_json_flag_constraints(runner: ClaudeRunner):
+    """The CLI rejects stream-json input unless the output format matches and
+    ``--verbose`` is set. Both are chained, so both are asserted here."""
+    argv = runner.build_argv("sonnet", has_images=True)
+
+    assert argv[argv.index("--input-format") + 1] == "stream-json"
+    assert argv[argv.index("--output-format") + 1] == "stream-json"
+    assert "--verbose" in argv
 
 
 def test_argv_never_contains_dangerous_flags(runner: ClaudeRunner):
@@ -146,6 +168,37 @@ async def test_prompt_travels_over_stdin_not_argv(
         "prompt text must never appear in argv"
     )
     assert secret_marker in prompt_dump.read_text()
+
+
+async def test_images_travel_as_stream_json_on_stdin(
+    runner: ClaudeRunner, fake_mode, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    argv_dump = tmp_path / "argv.json"
+    prompt_dump = tmp_path / "prompt.txt"
+    monkeypatch.setenv("FAKE_CLAUDE_ARGV_DUMP", str(argv_dump))
+    monkeypatch.setenv("FAKE_CLAUDE_PROMPT_DUMP", str(prompt_dump))
+    fake_mode("message")
+
+    image = ImageAttachment(media_type="image/png", data="AAAA")
+    decision = await runner.run(PROMPT, "sonnet", images=[image])
+
+    # The fake emits a newline-delimited stream for this output format, so a
+    # decision coming back at all proves the terminal result event was found.
+    assert decision.kind == KIND_MESSAGE
+
+    recorded_argv = json.loads(argv_dump.read_text())
+    assert recorded_argv[recorded_argv.index("--input-format") + 1] == "stream-json"
+    assert "AAAA" not in " ".join(recorded_argv)
+
+    stdin_payload = json.loads(prompt_dump.read_text())
+    assert stdin_payload["type"] == "user"
+    blocks = stdin_payload["message"]["content"]
+    assert blocks[0]["type"] == "text"
+    assert PROMPT in blocks[0]["text"]
+    assert blocks[1] == {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"},
+    }
 
 
 # -- failure mapping -------------------------------------------------------
