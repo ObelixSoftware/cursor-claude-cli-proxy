@@ -260,7 +260,8 @@ async def test_oversized_request_is_413(client: httpx.AsyncClient):
     assert "maximum size" in response.json()["error"]["message"]
 
 
-async def test_image_input_is_rejected_clearly(client: httpx.AsyncClient):
+async def test_image_input_is_accepted(client: httpx.AsyncClient, fake_mode):
+    fake_mode("message", text="A tiny PNG.")
     body = {
         "model": "claude-cli-proxy",
         "messages": [
@@ -277,8 +278,25 @@ async def test_image_input_is_rejected_clearly(client: httpx.AsyncClient):
         ],
     }
     response = await client.post("/v1/chat/completions", json=body, headers=AUTH_HEADERS)
-    assert response.status_code == 400
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "A tiny PNG."
 
+
+async def test_audio_input_is_rejected_clearly(client: httpx.AsyncClient):
+    body = {
+        "model": "claude-cli-proxy",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "transcribe this"},
+                    {"type": "input_audio", "input_audio": {"data": "AAAA"}},
+                ],
+            }
+        ],
+    }
+    response = await client.post("/v1/chat/completions", json=body, headers=AUTH_HEADERS)
+    assert response.status_code == 400
     message = response.json()["error"]["message"]
-    assert "image_url" in message
-    assert "text only" in message
+    assert "input_audio" in message
+    assert "not supported" in message

@@ -41,6 +41,7 @@ from .errors import (
     UpstreamModelError,
 )
 from .logging_setup import configure_logging, get_logger
+from .images import ImageAttachment
 from .normalize import (
     FLAVOR_CHAT,
     FLAVOR_RESPONSES,
@@ -176,6 +177,7 @@ async def _stream_exchange(
     model_alias: str,
     builder: StreamBuilder,
     exchange: Exchange,
+    images: list[ImageAttachment] | None = None,
 ) -> AsyncIterator[str]:
     """Drive one streaming request.
 
@@ -184,7 +186,7 @@ async def _stream_exchange(
     the gap until the answer is ready. Once the stream is open an HTTP error
     status is no longer available, so failures are reported in band.
     """
-    work = asyncio.ensure_future(runner.run(prompt, model_alias, exchange))
+    work = asyncio.ensure_future(runner.run(prompt, model_alias, exchange, images))
     _keep_until_done(work)
     watcher = asyncio.ensure_future(_watch_for_disconnect(request))
 
@@ -397,6 +399,7 @@ def create_app(
             model_alias = cfg.resolve_model_alias(normalized.requested_model)
             model_id = normalized.requested_model or "claude-cli-proxy"
 
+            attachments = normalized.images
             exchange.record_normalized(
                 flavor=normalized.api_flavor,
                 model_alias=model_alias,
@@ -405,15 +408,18 @@ def create_app(
                 endpoint_flavor=endpoint_flavor,
                 turns=len(normalized.turns),
                 tool_names=[tool.name for tool in normalized.tools],
+                image_count=len(attachments),
                 top_level_fields=sorted(body),
             )
 
             _LOG.info(
-                "%s request accepted: flavor=%s turns=%d tools=%d stream=%s alias=%s",
+                "%s request accepted: flavor=%s turns=%d tools=%d images=%d "
+                "stream=%s alias=%s",
                 request.url.path,
                 normalized.api_flavor,
                 len(normalized.turns),
                 len(normalized.tools),
+                len(attachments),
                 normalized.stream,
                 model_alias,
             )
@@ -445,13 +451,14 @@ def create_app(
                         model_alias=model_alias,
                         builder=builder,
                         exchange=exchange,
+                        images=attachments,
                     ),
                     media_type="text/event-stream",
                     headers=_SSE_HEADERS,
                 )
 
             decision = await _run_guarded(
-                request, active.run(prompt, model_alias, exchange)
+                request, active.run(prompt, model_alias, exchange, attachments)
             )
 
             if decision.kind == KIND_ERROR:

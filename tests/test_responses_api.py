@@ -166,7 +166,8 @@ async def test_chat_body_posted_to_responses_endpoint_is_honoured(
     assert response.json()["object"] == "chat.completion"
 
 
-async def test_image_input_is_rejected(client: httpx.AsyncClient):
+async def test_image_input_is_accepted(client: httpx.AsyncClient, fake_mode):
+    fake_mode("message", text="A tiny PNG.")
     body = {
         "model": "claude-cli-proxy",
         "input": [
@@ -174,14 +175,30 @@ async def test_image_input_is_rejected(client: httpx.AsyncClient):
                 "type": "message",
                 "role": "user",
                 "content": [
-                    {"type": "input_image", "image_url": "data:image/png;base64,AA"}
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
                 ],
             }
         ],
     }
     response = await client.post("/v1/responses", json=body, headers=AUTH_HEADERS)
+    assert response.status_code == 200
+    assert response.json()["object"] == "response"
+
+
+async def test_audio_input_is_rejected(client: httpx.AsyncClient):
+    body = {
+        "model": "claude-cli-proxy",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_audio", "input_audio": {"data": "AAAA"}}],
+            }
+        ],
+    }
+    response = await client.post("/v1/responses", json=body, headers=AUTH_HEADERS)
     assert response.status_code == 400
-    assert "text only" in response.json()["error"]["message"]
+    assert "input_audio" in response.json()["error"]["message"]
 
 
 async def test_empty_input_is_rejected(client: httpx.AsyncClient):

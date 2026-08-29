@@ -21,6 +21,7 @@ import contextlib
 import json
 import os
 import signal
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -35,6 +36,7 @@ from .errors import (
     ResponseTooLargeError,
 )
 from .logging_setup import get_logger
+from .images import ImageAttachment, encode_cli_stdin
 from .schema import ADAPTER_OUTPUT_SCHEMA, SchemaViolation, validate_adapter_output
 
 _LOG = get_logger()
@@ -179,37 +181,56 @@ class ClaudeRunner:
     def settings(self) -> Settings:
         return self._settings
 
-    def build_argv(self, model_alias: str) -> list[str]:
+    def build_argv(self, model_alias: str, *, has_images: bool = False) -> list[str]:
         """Build the fixed argv for one invocation.
 
         Every element is a discrete list entry, so no value can be reinterpreted
-        as a shell token.
+        as a shell token. ``--input-format stream-json`` is added only when the
+        request carries images, so text-only invocations stay unchanged.
+
+        The CLI enforces two chained constraints on that flag, both verified
+        against Claude Code 2.1.231:
+
+        * ``--input-format stream-json`` requires ``--output-format stream-json``
+        * under ``--print``, ``--output-format stream-json`` requires ``--verbose``
+
+        So an image request switches all three together. ``--verbose`` only
+        changes what the CLI writes to stdout; the terminal ``result`` event
+        carries the same envelope the single-object ``json`` format returns.
         """
-        return [
+        argv = [
             self._settings.claude_executable,
             "--print",
-            "--safe-mode",
-            "--tools",
-            STRUCTURED_OUTPUT_TOOL,
-            "--disallowedTools",
-            ",".join(DENIED_TOOLS),
-            "--disable-slash-commands",
-            "--no-session-persistence",
-            "--output-format",
-            "json",
-            "--model",
-            model_alias,
-            "--system-prompt",
-            self._system_prompt,
-            "--json-schema",
-            json.dumps(ADAPTER_OUTPUT_SCHEMA, separators=(",", ":")),
         ]
+        if has_images:
+            argv.extend(["--input-format", "stream-json", "--verbose"])
+        argv.extend(
+            [
+                "--safe-mode",
+                "--tools",
+                STRUCTURED_OUTPUT_TOOL,
+                "--disallowedTools",
+                ",".join(DENIED_TOOLS),
+                "--disable-slash-commands",
+                "--no-session-persistence",
+                "--output-format",
+                "stream-json" if has_images else "json",
+                "--model",
+                model_alias,
+                "--system-prompt",
+                self._system_prompt,
+                "--json-schema",
+                json.dumps(ADAPTER_OUTPUT_SCHEMA, separators=(",", ":")),
+            ]
+        )
+        return argv
 
     async def run(
         self,
         prompt: str,
         model_alias: str,
         exchange: Exchange | None = None,
+        images: Sequence[ImageAttachment] | None = None,
     ) -> ClaudeDecision:
         """Invoke the CLI once and return its validated decision.
 
@@ -217,9 +238,10 @@ class ClaudeRunner:
         one, so existing callers need no change.
         """
         recorder = exchange or NULL_EXCHANGE
-        argv = self.build_argv(model_alias)
+        attachments = list(images or ())
+        argv = self.build_argv(model_alias, has_images=bool(attachments))
         recorder.record_argv(argv)
-        payload = prompt.encode("utf-8")
+        payload = encode_cli_stdin(prompt, attachments)
 
         async with self._semaphore:
             stdout, stderr, returncode = await self._exec(argv, payload, recorder)
@@ -227,7 +249,9 @@ class ClaudeRunner:
         recorder.record_claude_result(
             stdout=stdout, stderr=stderr, returncode=returncode
         )
-        decision = self._parse_envelope(stdout, stderr, returncode)
+        decision = self._parse_envelope(
+            stdout, stderr, returncode, stream_json=bool(attachments)
+        )
         recorder.record_decision(decision)
         return decision
 
@@ -298,7 +322,12 @@ class ClaudeRunner:
         return stdout, stderr, proc.returncode
 
     def _parse_envelope(
-        self, stdout: bytes, stderr: bytes, returncode: int | None
+        self,
+        stdout: bytes,
+        stderr: bytes,
+        returncode: int | None,
+        *,
+        stream_json: bool = False,
     ) -> ClaudeDecision:
         if len(stdout) > self._settings.max_response_bytes:
             raise ResponseTooLargeError(log_hint="claude stdout over configured limit")
@@ -320,10 +349,15 @@ class ClaudeRunner:
         if not stdout.strip():
             raise ClaudeOutputError(log_hint="claude produced empty stdout")
 
-        try:
-            envelope = json.loads(stdout.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ClaudeOutputError(log_hint="claude stdout was not valid JSON") from exc
+        if stream_json:
+            envelope = _result_event_from_stream(stdout)
+        else:
+            try:
+                envelope = json.loads(stdout.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ClaudeOutputError(
+                    log_hint="claude stdout was not valid JSON"
+                ) from exc
 
         if not isinstance(envelope, dict):
             raise ClaudeOutputError(log_hint="claude envelope was not an object")
@@ -442,6 +476,41 @@ class ClaudeRunner:
             raise
 
         return proc.returncode, out, err
+
+
+def _result_event_from_stream(stdout: bytes) -> dict[str, Any]:
+    """Pull the terminal ``result`` event out of stream-json stdout.
+
+    ``--output-format stream-json`` writes one JSON object per line: session
+    init, assistant turns, then exactly one ``type: "result"`` event whose
+    fields match the single-object ``--output-format json`` envelope. Only that
+    event is read, so the caller's envelope handling is identical either way.
+
+    Lines that are not JSON objects are skipped rather than fatal: ``--verbose``
+    is mandatory for this output format and is free to interleave diagnostics.
+    Skipping them cannot smuggle prose into a decision, because a well-formed
+    ``result`` event is still required.
+    """
+    try:
+        text = stdout.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ClaudeOutputError(log_hint="claude stdout was not valid UTF-8") from exc
+
+    envelope: dict[str, Any] | None = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            event = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            envelope = event
+
+    if envelope is None:
+        raise ClaudeOutputError(log_hint="no result event in claude stream-json stdout")
+    return envelope
 
 
 def _safe_subtype(value: Any) -> str:

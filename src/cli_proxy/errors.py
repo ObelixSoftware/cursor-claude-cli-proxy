@@ -62,8 +62,8 @@ class UnsupportedContentError(ProxyError):
     status_code = 400
     error_type = "invalid_request_error"
     client_message = (
-        "Unsupported message content. This proxy version accepts text only; "
-        "image, audio and file inputs are not supported."
+        "Unsupported message content. This proxy version accepts text and "
+        "images; audio and file inputs are not supported."
     )
 
 

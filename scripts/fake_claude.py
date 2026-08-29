@@ -31,6 +31,10 @@ import os
 import sys
 import time
 
+#: Set from ``--output-format`` on each run; drives how ``_write_envelope``
+#: frames the reply.
+_OUTPUT_FORMAT = "text"
+
 ENVELOPE_BASE = {
     "type": "result",
     "subtype": "success",
@@ -76,6 +80,60 @@ def _record(argv: list[str], prompt: str) -> None:
             json.dump(sorted(os.environ), handle)
 
 
+def _flag_value(argv: list[str], flag: str) -> str | None:
+    if flag not in argv:
+        return None
+    index = argv.index(flag) + 1
+    return argv[index] if index < len(argv) else None
+
+
+def _reject_invalid_format_combination(argv: list[str]) -> str | None:
+    """Mirror the real CLI's validation of the format flags.
+
+    Claude Code 2.1.231 refuses two combinations outright. The fake enforces
+    them so a proxy change that violates the contract fails in the test suite
+    instead of only against the real binary.
+    """
+    input_format = _flag_value(argv, "--input-format")
+    output_format = _flag_value(argv, "--output-format")
+
+    if input_format == "stream-json" and output_format != "stream-json":
+        return "Error: --input-format=stream-json requires output-format=stream-json."
+
+    if (
+        output_format == "stream-json"
+        and "--print" in argv
+        and "--verbose" not in argv
+    ):
+        return "Error: When using --print, --output-format=stream-json requires --verbose"
+
+    return None
+
+
+def _write_envelope(envelope: dict) -> None:
+    """Write the envelope in whichever output format was requested.
+
+    ``stream-json`` emits newline-delimited events with the envelope last, so
+    the proxy has to locate the terminal ``result`` event rather than parsing
+    the whole of stdout as one object.
+    """
+    if _OUTPUT_FORMAT == "stream-json":
+        preamble = [
+            {"type": "system", "subtype": "init", "session_id": envelope["session_id"]},
+            {
+                "type": "assistant",
+                "message": {"role": "assistant", "content": []},
+                "session_id": envelope["session_id"],
+            },
+        ]
+        for event in preamble:
+            sys.stdout.write(json.dumps(event) + "\n")
+        sys.stdout.write(json.dumps(envelope) + "\n")
+    else:
+        sys.stdout.write(json.dumps(envelope))
+    sys.stdout.flush()
+
+
 def _emit(structured: object | None, *, result_text: str | None = None) -> None:
     envelope = dict(ENVELOPE_BASE)
     if structured is not None:
@@ -83,8 +141,7 @@ def _emit(structured: object | None, *, result_text: str | None = None) -> None:
         envelope["result"] = json.dumps(structured)
     if result_text is not None:
         envelope["result"] = result_text
-    sys.stdout.write(json.dumps(envelope))
-    sys.stdout.flush()
+    _write_envelope(envelope)
 
 
 def _handle_subcommands(argv: list[str]) -> int | None:
@@ -118,11 +175,20 @@ def _handle_subcommands(argv: list[str]) -> int | None:
 
 
 def main() -> int:
+    global _OUTPUT_FORMAT
+
     argv = sys.argv[1:]
 
     early = _handle_subcommands(argv)
     if early is not None:
         return early
+
+    rejection = _reject_invalid_format_combination(argv)
+    if rejection is not None:
+        sys.stderr.write(rejection + "\n")
+        return 1
+
+    _OUTPUT_FORMAT = _flag_value(argv, "--output-format") or "text"
 
     prompt = sys.stdin.read() if not sys.stdin.isatty() else ""
     _record(argv, prompt)
@@ -166,7 +232,7 @@ def main() -> int:
             }
         ]
         envelope["result"] = "I could not use the structured output tool."
-        sys.stdout.write(json.dumps(envelope))
+        _write_envelope(envelope)
         return 0
 
     if mode == "schema_break":

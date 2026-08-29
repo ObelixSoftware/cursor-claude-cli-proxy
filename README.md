@@ -90,6 +90,7 @@ It shells out to `claude`, which uses whatever login state it already has.
 │                   PAYLOAD SHAPE, not the URL                        │
 │  4. serialise     one text document: editor instructions,           │
 │                   tool catalogue, tool choice, conversation turns   │
+│                   (+ image blocks on stdin when the turn has them)  │
 └─────────────────────────────────────────────────────────────────────┘
     │  prompt document on STDIN (never argv, never a shell string)
     ▼
@@ -97,10 +98,12 @@ It shells out to `claude`, which uses whatever login state it already has.
 │ cli_proxy.claude_runner                                             │
 │                                                                     │
 │   claude --print --safe-mode                                        │
+│          [--input-format stream-json --verbose]                     │
+│                                       (only when images present)    │
 │          --tools StructuredOutput                                   │
 │          --disallowedTools Agent,Bash,...,Write                     │
 │          --disable-slash-commands --no-session-persistence          │
-│          --output-format json                                       │
+│          --output-format json | stream-json  (stream-json for images)│
 │          --model <alias>                                            │
 │          --system-prompt <adapter prompt>                           │
 │          --json-schema <output contract>                            │
@@ -171,6 +174,7 @@ documented deviation from the original design intent; see
 | `src/cli_proxy/app.py` | FastAPI routes, auth, size limits, the streaming generator, disconnect handling |
 | `src/cli_proxy/config.py` | Environment parsing, validation, model alias map |
 | `src/cli_proxy/normalize.py` | Both payload shapes → one conversation model; prompt serialisation |
+| `src/cli_proxy/images.py` | Image part parsing and stream-json stdin encoding for vision |
 | `src/cli_proxy/claude_runner.py` | argv construction, subprocess lifecycle, timeout/kill escalation, health probes |
 | `src/cli_proxy/schema.py` | The output contract and its validator |
 | `src/cli_proxy/openai_out.py` | Chat Completions / Responses bodies and SSE stream builders |
@@ -198,9 +202,10 @@ Full detail is in [`LIMITATIONS.md`](LIMITATIONS.md). The headlines:
   idle timeout, but Cursor's actual tolerance for a silent stream is not
   documented and has not been measured. If Cursor gives up on long turns, this is
   the first constant to try lowering (`_HEARTBEAT_SECONDS` in `app.py`).
-- **Text input only.** `image_url`, `input_image`, `image`, `input_audio`,
-  `audio`, `input_file`, `file` and `file_url` content parts are rejected with
-  HTTP 400. Pasting a screenshot into a chat turn fails the whole request.
+- **Images are accepted; audio and files are not.** `image_url`, `input_image`
+  and `image` parts (data URLs and `https://` URLs) are forwarded to Claude as
+  vision input. `input_audio`, `audio`, `input_file`, `file` and `file_url`
+  parts are still rejected with HTTP 400.
 - **Stateless per request, so cost grows steeply.** Cursor resends the entire
   conversation every turn and every invocation re-pays for the whole prompt. Two
   observed real Cursor turns reported **214,250** and **430,367** prompt tokens.
@@ -735,17 +740,17 @@ curl -s -H "Authorization: Bearer $CLI_PROXY_TOKEN" \
      }' | jq -r '.choices[0].message.content'
 ```
 
-### Image input is refused
+### Image input is accepted
 
 ```bash
-curl -s -o /dev/null -w '%{http_code}\n' \
-     -H "Authorization: Bearer $CLI_PROXY_TOKEN" \
+# 1x1 PNG (valid, tiny). Expect HTTP 200 and a vision reply.
+curl -sS -H "Authorization: Bearer $CLI_PROXY_TOKEN" \
      -H 'Content-Type: application/json' \
      "$BASE/v1/chat/completions" \
      -d '{"model":"claude-cli-sonnet","messages":[{"role":"user","content":[
           {"type":"text","text":"what is this"},
-          {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]}'
-# 400
+          {"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="}}]}]}' \
+     | jq -r '.choices[0].message.content'
 ```
 
 ### The scripted smoke test
@@ -762,7 +767,7 @@ CLI_PROXY_TOKEN='<your-token>' ./scripts/smoke-test.sh https://cli-proxy.example
 
 It runs ten checks: health, unauthenticated refusal, wrong-token refusal, model
 list, non-streaming completion, streaming completion, Responses API, a tool-call
-decision, a tool-result round trip, and image rejection. It reads `.env` if
+decision, a tool-result round trip, and image acceptance. It reads `.env` if
 `CLI_PROXY_TOKEN` is not already exported, and never echoes the token.
 
 > **`smoke-test.sh` makes REAL Claude calls** and consumes real quota. It prints
@@ -969,7 +974,8 @@ Every client-facing error is an OpenAI-shaped body:
 | 504 "did not finish before the configured timeout" | The invocation exceeded `CLAUDE_TIMEOUT_SECONDS` (default 600). The subprocess is SIGTERMed, given 5 s, then SIGKILLed. | `ClaudeTimeoutError` / **504** | Raise `CLAUDE_TIMEOUT_SECONDS`, and raise the tunnel's timeouts to match. Recurrent timeouts usually mean the conversation has grown very large. |
 | 502 "produced more output than the configured limit" | CLI stdout exceeded `CLI_PROXY_MAX_RESPONSE_BYTES` (default 4 MiB). | `ResponseTooLargeError` / **502** | Raise the limit, or ask for a shorter answer. |
 | 413 "Request body exceeds the configured maximum size" | Request over `CLI_PROXY_MAX_REQUEST_BYTES` (default 4 MiB). Long agent sessions do reach this. | `RequestTooLargeError` / **413** | Raise the limit, or start a fresh conversation in Cursor. |
-| 400 "accepts text only; image, audio and file inputs are not supported" | An `image_url` / `input_image` / `input_audio` / `input_file` / `file_url` content part. | `UnsupportedContentError` / **400** | Send text. There is no workaround in this version. |
+| 400 "accepts text and images; audio and file inputs are not supported" | An `input_audio` / `audio` / `input_file` / `file` / `file_url` content part. | `UnsupportedContentError` / **400** | Send text or an image. Audio and generic files are out of scope. |
+| 400 about image URLs or media types | A local path, `file://` / `http://` URL, SVG/TIFF, invalid base64, or an image over 5 MiB. | `InvalidRequestError` / **400** | Use a `data:image/...;base64,...` URL or an `https://` image. JPEG, PNG, GIF and WebP only. |
 | 400 "The request payload could not be interpreted." | Malformed JSON, an empty body, no `messages` and no `input`, a bad role, a tool without a `name`, a non-numeric `temperature`. | `InvalidRequestError` / **400** | The message names the specific problem. A debug dump's `inbound.body` shows exactly what was sent. |
 | Startup exits immediately with "cli-proxy configuration error: ..." | Bad environment: missing/short/placeholder token, invalid log level, out-of-range port, a non-numeric value, or `CLAUDE_WORKING_DIR` pointing at something that is not a directory. | `ConfigError`, exit code 2 | The message names the variable. |
 | `/health` returns 503 with `"status": "degraded"` | `claude_executable_available` or `claude_authenticated` is false. `detail` says which. | not a `ProxyError` | Fix per the rows above. This 503 is a health verdict, not a request failure. |

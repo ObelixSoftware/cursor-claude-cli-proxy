@@ -12,6 +12,7 @@ from cli_proxy.normalize import (
     FLAVOR_RESPONSES,
     describe_tool_choice,
     detect_flavor,
+    extract_content,
     extract_text,
     normalize_request,
     normalize_tools,
@@ -68,14 +69,30 @@ def test_extract_text_handles_none():
     assert extract_text(None) == ""
 
 
-@pytest.mark.parametrize(
-    "part_type", ["image_url", "input_image", "input_audio", "input_file", "file"]
-)
-def test_binary_content_is_rejected_clearly(part_type):
+@pytest.mark.parametrize("part_type", ["input_audio", "input_file", "file", "file_url"])
+def test_audio_and_file_content_is_rejected_clearly(part_type):
     with pytest.raises(UnsupportedContentError) as excinfo:
         extract_text([{"type": part_type, "whatever": {}}])
     assert part_type in str(excinfo.value)
-    assert "text only" in str(excinfo.value)
+    assert "audio and file" in str(excinfo.value) or "not supported" in str(
+        excinfo.value
+    )
+
+
+def test_image_url_part_is_extracted():
+    text, images = extract_content(
+        [
+            {"type": "text", "text": "what is this"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,AAAA"},
+            },
+        ]
+    )
+    assert text == "what is this"
+    assert len(images) == 1
+    assert images[0].media_type == "image/png"
+    assert images[0].data is not None
 
 
 # -- tool definitions ------------------------------------------------------
@@ -278,10 +295,19 @@ def test_responses_function_call_output_accepts_structured_output():
     assert json.loads(normalized.turns[0].text) == {"ok": True}
 
 
-def test_responses_rejects_image_input():
-    body = {"input": [{"type": "input_image", "image_url": "data:..."}]}
-    with pytest.raises(UnsupportedContentError):
-        normalize_request(body)
+def test_responses_accepts_image_input():
+    body = {
+        "input": [
+            {
+                "type": "input_image",
+                "image_url": "data:image/png;base64,AAAA",
+            }
+        ]
+    }
+    normalized = normalize_request(body)
+    assert len(normalized.images) == 1
+    assert normalized.images[0].media_type == "image/png"
+    assert normalized.turns[0].role == "user"
 
 
 def test_responses_rejects_unknown_item_type():
