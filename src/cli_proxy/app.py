@@ -12,10 +12,10 @@ header, a prompt body, source code, tool arguments or Claude output. (The
 opt-in debug dump in :mod:`cli_proxy.debug_dump` deliberately does write those
 to disk; it is off unless the operator switches it on.)
 
-Streaming requests open the event stream *before* Claude is invoked and hold it
-open with keepalives, because a client that gives up waiting for the first byte
-is indistinguishable from a broken proxy. The model text itself still arrives in
-one burst -- see ``LIMITATIONS.md``.
+Streaming requests wait for the CLI envelope *before* opening SSE, so a
+session-limit or process failure can still be an HTTP 429/502 that Cursor will
+render. The model text itself still arrives in one burst -- see
+``LIMITATIONS.md``.
 """
 
 from __future__ import annotations
@@ -41,11 +41,9 @@ from .errors import (
     UpstreamModelError,
 )
 from .logging_setup import configure_logging, get_logger
-from .images import ImageAttachment
 from .normalize import (
     FLAVOR_CHAT,
     FLAVOR_RESPONSES,
-    ConversationIdentity,
     NormalizedRequest,
     derive_conversation_identity,
     normalize_request,
@@ -65,24 +63,11 @@ _LOG = get_logger()
 #: How often the disconnect watcher polls while Claude is running.
 _DISCONNECT_POLL_SECONDS = 0.5
 
-#: How long the stream may stay silent before a keepalive is emitted. Well under
-#: the idle timeout of any HTTP client or reverse proxy likely to sit in front.
-_HEARTBEAT_SECONDS = 7.0
-
 _SSE_HEADERS = {
     "Cache-Control": "no-cache, no-transform",
     "Connection": "keep-alive",
     "X-Accel-Buffering": "no",
 }
-
-#: Tasks kept referenced while they reap their subprocess after a cancellation,
-#: so the garbage collector cannot drop them mid-cleanup.
-_REAPING: set[asyncio.Task[Any]] = set()
-
-
-def _keep_until_done(task: asyncio.Task[Any]) -> None:
-    _REAPING.add(task)
-    task.add_done_callback(_REAPING.discard)
 
 
 def load_adapter_system_prompt() -> str:
@@ -171,91 +156,45 @@ async def _run_guarded(request: Request, coro: Any) -> ClaudeDecision:
 StreamBuilder = ChatStreamBuilder | ResponseStreamBuilder
 
 
-async def _stream_exchange(
-    request: Request,
-    runner: ClaudeRunner,
-    *,
-    prompt: str,
-    model_alias: str,
+async def _stream_decision(
     builder: StreamBuilder,
+    decision: ClaudeDecision,
     exchange: Exchange,
-    images: list[ImageAttachment] | None = None,
-    identity: ConversationIdentity | None = None,
 ) -> AsyncIterator[str]:
-    """Drive one streaming request.
+    """Emit a finished Claude decision as SSE.
 
-    The opening events go out before Claude is started, so time-to-first-byte
-    is a few milliseconds rather than the model's full latency. Keepalives fill
-    the gap until the answer is ready. Once the stream is open an HTTP error
-    status is no longer available, so failures are reported in band.
+    The CLI has already completed successfully. An HTTP error status is no
+    longer available once this generator is returned as a ``StreamingResponse``,
+    so any failure after the first chunk is reported in band.
     """
-    work = asyncio.ensure_future(
-        runner.run(prompt, model_alias, exchange, images, identity)
-    )
-    _keep_until_done(work)
-    watcher = asyncio.ensure_future(_watch_for_disconnect(request))
 
     def emit(chunks: Iterator[str]) -> Iterator[str]:
         for chunk in chunks:
             exchange.record_sse_chunk(chunk)
             yield chunk
 
+    sent_tokens = False
     try:
         for chunk in emit(builder.opening()):
+            sent_tokens = True
             yield chunk
-
-        while not work.done():
-            done, _ = await asyncio.wait(
-                {work, watcher},
-                timeout=_HEARTBEAT_SECONDS,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if work in done:
-                break
-            if watcher in done:
-                exchange.record_note("client disconnected before the answer was ready")
-                _LOG.info("client disconnected mid-stream; claude subprocess cancelled")
-                return
-            for chunk in emit([builder.heartbeat()]):
-                yield chunk
-
-        failure: str | None = None
-        decision: ClaudeDecision | None = None
-        try:
-            decision = work.result()
-        except ProxyError as exc:
-            failure = exc.client_message
-            exchange.record_error(exc)
-            if exc.log_hint:
-                _LOG.warning("stream failed after opening: %s", exc.log_hint)
-        except asyncio.CancelledError:
+        for chunk in emit(builder.body(decision)):
+            sent_tokens = True
+            yield chunk
+    except Exception as exc:  # noqa: BLE001 - must not leak a traceback
+        if not sent_tokens:
             raise
-        except Exception as exc:  # noqa: BLE001 - must not leak a traceback
-            failure = "The proxy failed to handle the request."
-            exchange.record_error(exc)
-            _LOG.error("stream failed after opening: %s", type(exc).__name__)
-        else:
-            if decision.kind == KIND_ERROR:
-                failure = (
-                    f"The model could not serve the request: {decision.error}"
-                )
-                exchange.record_note("model returned a structured error")
-                _LOG.warning("model returned a structured error")
-
-        if failure is None and decision is not None:
-            chunks: Iterator[str] = builder.body(decision)
-        else:
-            chunks = builder.failure(
-                failure or "The proxy failed to handle the request."
-            )
-        for chunk in emit(chunks):
+        failure = (
+            exc.client_message
+            if isinstance(exc, ProxyError)
+            else "The proxy failed to handle the request."
+        )
+        failure_type = exc.error_type if isinstance(exc, ProxyError) else "api_error"
+        exchange.record_error(exc)
+        _LOG.error("stream failed after opening: %s", type(exc).__name__)
+        for chunk in emit(builder.failure(failure, error_type=failure_type)):
             yield chunk
     finally:
-        watcher.cancel()
-        if not work.done():
-            # Cancellation propagates into ClaudeRunner.run, which SIGTERMs then
-            # SIGKILLs the subprocess. The task stays referenced until it has.
-            work.cancel()
         exchange.close()
 
 
@@ -327,10 +266,11 @@ def create_app(
             "max_concurrency": cfg.max_concurrency,
             "agents_running": active.agents_running,
             "timeout_seconds": cfg.timeout_seconds,
-            # The content is still delivered in one burst, but the event stream
-            # itself opens before Claude is invoked.
+            # The content is still delivered in one burst. The event stream
+            # opens only after the CLI envelope is known, so a 429/502 can
+            # still be an HTTP status Cursor will render.
             "streaming": "buffered",
-            "stream_opens_immediately": True,
+            "stream_opens_immediately": False,
             # A boolean only. /health is unauthenticated, so the dump directory
             # path stays out of it.
             "debug_dump": request.app.state.dumper.enabled,
@@ -452,22 +392,30 @@ def create_app(
                     if wants_responses
                     else ChatStreamBuilder(model_id)
                 )
+                # Await the CLI before opening SSE. Cursor Agent ignores
+                # in-band ``data: {"error": ...}`` on a 200 stream and only
+                # renders HTTP status + JSON ``error.message``. A session
+                # limit is known from the finished envelope, so fail the
+                # request with 429 rather than opening a blank turn.
+                decision = await _run_guarded(
+                    request,
+                    active.run(
+                        prompt, model_alias, exchange, attachments, identity
+                    ),
+                )
+                if decision.kind == KIND_ERROR:
+                    _LOG.warning("model returned a structured error")
+                    raise UpstreamModelError(
+                        f"The model could not serve the request: {decision.error}",
+                        log_hint="model structured error",
+                    )
                 exchange.record_response(
                     status=200,
                     body="text/event-stream; the emitted events are in 'sse_chunks'",
                 )
                 stream_owns_exchange = True
                 return StreamingResponse(
-                    _stream_exchange(
-                        request,
-                        active,
-                        prompt=prompt,
-                        model_alias=model_alias,
-                        builder=builder,
-                        exchange=exchange,
-                        images=attachments,
-                        identity=identity,
-                    ),
+                    _stream_decision(builder, decision, exchange),
                     media_type="text/event-stream",
                     headers=_SSE_HEADERS,
                 )

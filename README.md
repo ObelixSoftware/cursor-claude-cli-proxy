@@ -134,7 +134,7 @@ Claude is constrained by `--json-schema` to return exactly one of:
 | --- | --- | --- |
 | `message` | A normal assistant reply. `content` is markdown. | `finish_reason: "stop"` with `content` |
 | `tool_calls` | One or more editor tools to run, each with a verbatim `name` and an `arguments` object. | `finish_reason: "tool_calls"` with OpenAI `tool_calls` |
-| `error` | Claude cannot serve the request at all. | HTTP 502 `UpstreamModelError`, or an in-band stream error |
+| `error` | Claude cannot serve the request at all. | HTTP 502 `UpstreamModelError` |
 
 **Unstructured prose is refused, not guessed at.** If Claude answers in free text
 instead of calling the structured-output tool, the proxy raises
@@ -193,18 +193,12 @@ documented deviation from the original design intent; see
 
 Full detail is in [`LIMITATIONS.md`](LIMITATIONS.md). The headlines:
 
-- **Streaming is buffered.** The SSE connection opens immediately —
-  time-to-first-byte measured at roughly 0.001–0.003 s — and emits a
-  `: keepalive` SSE comment every 7 seconds while Claude runs. But the model text
-  still arrives in **one burst at the end**. There is no token-by-token
-  streaming, because `claude --print` writes its JSON envelope only on
-  completion. (Before the stream was made to open early, time-to-first-byte
-  equalled full model latency — 4.35 s, 15.76 s and 37.2 s were measured — which
-  is exactly what made Cursor appear to hang with no response at all.)
-- **The 7-second heartbeat is a guess.** It is comfortably under any normal HTTP
-  idle timeout, but Cursor's actual tolerance for a silent stream is not
-  documented and has not been measured. If Cursor gives up on long turns, this is
-  the first constant to try lowering (`_HEARTBEAT_SECONDS` in `app.py`).
+- **Streaming is buffered.** The proxy waits for the CLI envelope before
+  opening SSE, then emits the finished answer in **one burst**. There is no
+  token-by-token streaming, because `claude --print` writes its JSON envelope
+  only on completion. Time-to-first-byte equals model latency. Cursor-bound
+  stream requests fail the HTTP request with 429/502 when the CLI errors
+  before any tokens — a 200 + in-band error is a blank turn in Cursor.
 - **Images are accepted; audio and files are not.** `image_url`, `input_image`
   and `image` parts (data URLs and `https://` URLs) are forwarded to Claude as
   vision input. `input_audio`, `audio`, `input_file`, `file` and `file_url`
@@ -227,6 +221,12 @@ Full detail is in [`LIMITATIONS.md`](LIMITATIONS.md). The headlines:
   prompt on a still-running agent does not inject text into `claude --print`;
   the matching process group is killed and a new invocation starts with the
   updated conversation. See [§10](#10-configuring-cursor).
+- **Claude session limits show up in Cursor as a 429, not a blank turn.** When
+  the CLI hits its five-hour session / usage limit it used to become a generic
+  502 ("The Claude Code CLI exited unsuccessfully"), which Cursor rendered as
+  a blank or failed turn. That is now HTTP 429 `rate_limit_error` with a fixed
+  message Cursor can display. The CLI's reset clock is classified, never
+  echoed. See [§13](#13-troubleshooting).
 - **`temperature` and `max_tokens` are hints, not limits.** They are described to
   the model in the prompt. The CLI exposes no flags for them.
 - **Debug dumps are cleartext.** See [§6](#6-configuration) and
@@ -527,7 +527,7 @@ output:
   "agents_running": 0,
   "timeout_seconds": 600.0,
   "streaming": "buffered",
-  "stream_opens_immediately": true,
+  "stream_opens_immediately": false,
   "debug_dump": false
 }
 ```
@@ -576,9 +576,10 @@ Non-streaming success is a `chat.completion` object with a single choice,
 CLI's own token accounting (`input_tokens` sums the plain, cache-creation and
 cache-read input counters).
 
-Streaming success is `text/event-stream`: an opening role delta, then
-`: keepalive` comments every 7 seconds, then the content chunk(s), a finish
-chunk, a usage-only chunk, and `data: [DONE]`.
+Streaming success is `text/event-stream` after the CLI envelope is known: an
+opening role delta, then the content chunk(s), a finish chunk, a usage-only
+chunk, and `data: [DONE]`. A CLI error before any token is HTTP 429/502 JSON,
+not a 200 stream.
 
 ### `POST /v1/responses`
 
@@ -589,21 +590,23 @@ turn); `tools` in either the nested or flat shape; `tool_choice`; `temperature`;
 `reasoning`, `web_search_call`, `file_search_call`, `computer_call`,
 `code_interpreter_call` and `item_reference` items are ignored as instruction-free.
 
-Streaming emits the full Responses event sequence: `response.created`,
-`response.in_progress`, keepalives, then `response.output_item.added` →
-`response.content_part.added` → `response.output_text.delta` →
-`response.output_text.done` → `response.content_part.done` →
-`response.output_item.done` per item (or the
+Streaming waits for the CLI envelope, then emits the full Responses event
+sequence: `response.created`, `response.in_progress`, then
+`response.output_item.added` → `response.content_part.added` →
+`response.output_text.delta` → `response.output_text.done` →
+`response.content_part.done` → `response.output_item.done` per item (or the
 `response.function_call_arguments.*` equivalents for tool calls), then
 `response.completed` and `data: [DONE]`.
 
 ### Errors while streaming
 
-Once the 200 has been sent, an HTTP error status is no longer available, so a
-later failure is reported **in band**: for Chat Completions a `finish_reason:
-"stop"` chunk followed by `data: {"error": {...}}` and `data: [DONE]`; for
-Responses a `response.failed` event followed by `data: [DONE]`. Failures detected
-*before* the stream opens still return an ordinary HTTP 4xx/5xx JSON error.
+If the CLI fails before any assistant token, the proxy does **not** open SSE.
+Cursor-bound stream requests return the same OpenAI-shaped JSON error as
+non-stream (HTTP **429** for a session limit, **502** for auth or process
+failure). A failure after a chunk has already gone out is reported **in band**:
+for Chat Completions a `finish_reason: "stop"` chunk followed by
+`data: {"error": {...}}` and `data: [DONE]`; for Responses a `response.failed`
+event followed by `data: [DONE]`.
 
 If the client disconnects mid-request, the Claude invocation is cancelled and
 its whole process group is reaped (SIGTERM, 5 s, SIGKILL).
@@ -668,7 +671,7 @@ Response (abridged):
 
 ### Streaming chat completion
 
-`-N` disables curl's own buffering, which you need to see the keepalives arrive.
+`-N` disables curl's own buffering.
 
 ```bash
 curl -sN -H "Authorization: Bearer $CLI_PROXY_TOKEN" \
@@ -681,15 +684,10 @@ curl -sN -H "Authorization: Bearer $CLI_PROXY_TOKEN" \
      }'
 ```
 
-Output — note the opening chunk arrives in milliseconds, the keepalives fill the
-wait, and the text arrives all at once:
+Output — the opening chunk and the text arrive together after the CLI finishes:
 
 ```
 data: {"id":"chatcmpl-...","object":"chat.completion.chunk",...,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}],"usage":null}
-
-: keepalive
-
-: keepalive
 
 data: {"id":"chatcmpl-...","choices":[{"index":0,"delta":{"content":"STREAM OK"},"finish_reason":null}],"usage":null}
 
@@ -700,18 +698,8 @@ data: {"id":"chatcmpl-...","choices":[],"usage":{"prompt_tokens":1210,"completio
 data: [DONE]
 ```
 
-To confirm the stream really does open immediately:
-
-```bash
-curl -sN -o /dev/null -w 'time_to_first_byte=%{time_starttransfer}s total=%{time_total}s\n' \
-     -H "Authorization: Bearer $CLI_PROXY_TOKEN" \
-     -H 'Content-Type: application/json' \
-     "$BASE/v1/chat/completions" \
-     -d '{"model":"claude-cli-sonnet","stream":true,
-          "messages":[{"role":"user","content":"Say hello."}]}'
-```
-
-Expect a first byte in single-digit milliseconds and a total in seconds.
+Time-to-first-byte equals model latency: the proxy waits for the CLI envelope
+before opening SSE so a session-limit 429 can still be an HTTP status.
 
 ### Responses API
 
@@ -868,6 +856,11 @@ Set `CLAUDE_MAX_CONCURRENCY` lower (even 1) if you want to serialise again.
 Raising it above 4 is allowed; each extra slot is another full Claude invocation
 and another copy of the prompt tokens.
 
+If the CLI hits its five-hour session limit, Cursor now sees a proper
+rate-limit error (HTTP 429, type `rate_limit_error`) instead of a blank turn
+or a generic "CLI exited unsuccessfully." The proxy sends a fixed message; the
+CLI's reset time is not forwarded. See [§13](#13-troubleshooting).
+
 ### The model picker does not select the model
 
 Cursor sends **its own** model name in the request body — the observed value was
@@ -922,7 +915,8 @@ back into Cursor's settings and pasting a new base URL, and any Cursor session
 mid-flight breaks. Use one to prove the integration works, then move to a named
 tunnel.
 
-SSE keepalives do survive a quick tunnel — verified with live Cursor traffic.
+A long Claude turn can trip a client first-byte timeout, because SSE no longer
+opens until the CLI envelope is known.
 
 ### Named tunnel setup
 
@@ -1038,11 +1032,12 @@ Every client-facing error is an OpenAI-shaped body:
 | 401 on every request even with the right token | The proxy started with no configured token. | `AuthenticationError` / **401** | Set `CLI_PROXY_TOKEN` and restart. `run.sh` refuses to start without one. |
 | 404 on every Cursor request, `/health` fine | Base URL includes `/v1`; Cursor appends its own, giving `/v1/v1/chat/completions`. | FastAPI 404 | Use `https://host` with **no** `/v1` suffix. |
 | Cursor shows nothing at all, no error | Requests may not be arriving. Tunnel down, hostname changed (quick tunnels change on every restart), or the base URL is wrong. | — | Turn on `CLI_PROXY_DEBUG_DUMP=1` and look in `debug-dumps/`. **A file per request means Cursor is reaching you** — read `inbound.headers` for `user-agent: Cursor/1.0` and `response.status`. **No files at all means the traffic never arrived**, so the problem is the URL or the tunnel, not the proxy. |
-| Cursor spins for a long time then gives up | The turn genuinely takes that long (observed ~11.4 s, and it grows with conversation length), or a tunnel/client idle timeout fired despite the keepalives. | possibly `ClaudeTimeoutError` / **504** | Check the proxy log for `claude subprocess ... exited rc=0`. Raise the tunnel's `keepAliveTimeout`. If Cursor gives up while keepalives are still flowing, lower `_HEARTBEAT_SECONDS` in `app.py` (7 s is an untested guess at Cursor's tolerance). |
+| Cursor spins for a long time then gives up | The turn genuinely takes that long (observed ~11.4 s, and it grows with conversation length), or a tunnel/client first-byte timeout fired while the proxy was still waiting for the CLI envelope. | possibly `ClaudeTimeoutError` / **504** | Check the proxy log for `claude subprocess ... exited rc=0`. Raise the tunnel's `keepAliveTimeout`. Streaming no longer opens SSE until the CLI finishes, so a long turn can trip a first-byte timeout. |
 | 502 "did not return usable structured output. The proxy refuses to guess at unstructured text" | Claude answered in prose. Usually the `StructuredOutput` tool was denied and appears under `permission_denials`; also covers empty stdout, non-JSON stdout, or output that fails the contract. | `ClaudeOutputError` / **502** | Check `claude --version` against 2.1.231. A CLI upgrade may have changed `--tools` semantics or the internal tool name; a dump's `claude_result.stdout` shows the envelope. See [`LIMITATIONS.md`](LIMITATIONS.md) §1. |
 | 502 "The model reported that it could not serve the request" | Claude used the contract's `error` shape — for example the conversation is contradictory, or it needs a tool Cursor did not offer. | `UpstreamModelError` / **502** | The message carries Claude's reason. Usually a prompt problem, not a proxy problem. |
-| 502 "The Claude Code CLI exited unsuccessfully" | Non-zero exit, or an envelope with `is_error`. stderr is classified but never echoed, so it will not appear in the response. | `ClaudeProcessError` / **502** | Run the same prompt through `claude --print` by hand. Raise `CLI_PROXY_LOG_LEVEL` to `DEBUG`. |
-| 502 "The Claude Code CLI is not authenticated" | The CLI reported an auth failure — logged out, or an expired OAuth token. Note this is **502**, not 503. | `ClaudeAuthError` / **502** | `claude auth status`, then sign in again. Confirm with `curl -s localhost:8787/health \| jq .claude_authenticated`. |
+| 502 "The Claude Code CLI exited unsuccessfully" | Non-zero exit, or an envelope with `is_error`. stderr is classified but never echoed, so it will not appear in the response. A 429 session limit is carved out (see the next row). | `ClaudeProcessError` / **502** | Run the same prompt through `claude --print` by hand. Raise `CLI_PROXY_LOG_LEVEL` to `DEBUG`. |
+| 429 "The Claude Code CLI has hit its usage limit" — or Cursor used to show a blank / failed turn here | The CLI hit its five-hour session / usage limit (`api_error_status` 429, often with `is_error` and a reset-time `result`). That used to be a generic 502, which Cursor rendered as nothing useful. It is now HTTP 429 `rate_limit_error` with a fixed client message. Cursor-bound stream requests fail the HTTP request with that 429 (they do not open SSE 200 with an in-band error Cursor ignores). The reset clock is classified, never echoed. | `ClaudeRateLimitError` / **429** | Wait until the session resets, or sign in with another Claude account, then retry. |
+| 502 "The Claude Code CLI is not authenticated" | The CLI reported an auth failure — logged out, or an expired OAuth token. Note this is **502**, not 503. A 429 is not treated as auth. | `ClaudeAuthError` / **502** | `claude auth status`, then sign in again. Confirm with `curl -s localhost:8787/health \| jq .claude_authenticated`. |
 | 504 "did not finish before the configured timeout" | The invocation exceeded `CLAUDE_TIMEOUT_SECONDS` (default 600). The process group is SIGTERMed, given 5 s, then SIGKILLed. | `ClaudeTimeoutError` / **504** | Raise `CLAUDE_TIMEOUT_SECONDS`, and raise the tunnel's timeouts to match. Recurrent timeouts usually mean the conversation has grown very large. |
 | 502 "produced more output than the configured limit" | CLI stdout exceeded `CLI_PROXY_MAX_RESPONSE_BYTES` (default 4 MiB). | `ResponseTooLargeError` / **502** | Raise the limit, or ask for a shorter answer. |
 | 413 "Request body exceeds the configured maximum size" | Request over `CLI_PROXY_MAX_REQUEST_BYTES` (default 4 MiB). Long agent sessions do reach this. | `RequestTooLargeError` / **413** | Raise the limit, or start a fresh conversation in Cursor. |

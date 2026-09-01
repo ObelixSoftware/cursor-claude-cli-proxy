@@ -32,6 +32,7 @@ from .errors import (
     ClaudeAuthError,
     ClaudeOutputError,
     ClaudeProcessError,
+    ClaudeRateLimitError,
     ClaudeTimeoutError,
     ClaudeUnavailableError,
     ResponseTooLargeError,
@@ -107,6 +108,15 @@ _AUTH_FAILURE_MARKERS = (
     "401",
 )
 
+#: Markers used only to *classify* a session / usage limit. The matched text
+#: is never returned to a client and never written into logs.
+_RATE_LIMIT_MARKERS = (
+    "session limit",
+    "rate_limit",
+    "rate limit",
+    "you've hit your",
+)
+
 
 @dataclass(frozen=True)
 class ClaudeDecision:
@@ -143,6 +153,54 @@ def _subprocess_env() -> dict[str, str]:
 def _looks_like_auth_failure(stderr_text: str) -> bool:
     lowered = stderr_text.lower()
     return any(marker in lowered for marker in _AUTH_FAILURE_MARKERS)
+
+
+def _looks_like_rate_limit(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in _RATE_LIMIT_MARKERS)
+
+
+def _status_is_rate_limit(value: Any) -> bool:
+    """True when ``api_error_status`` is HTTP 429, as an int or as ``"429"``."""
+    if value is None:
+        return False
+    if value == 429:
+        return True
+    text = str(value).strip()
+    if text == "429":
+        return True
+    try:
+        return int(text) == 429
+    except (TypeError, ValueError):
+        return False
+
+
+def _envelope_is_rate_limited(envelope: dict[str, Any] | None) -> bool:
+    """Detect a CLI session / usage limit from a parsed result envelope.
+
+    Prefer ``api_error_status == 429``. ``terminal_reason == "api_error"``
+    together with a 429 is treated the same way. Result text is classified
+    only; it is never echoed.
+    """
+    if not isinstance(envelope, dict):
+        return False
+    if _status_is_rate_limit(envelope.get("api_error_status")):
+        return True
+    if envelope.get("terminal_reason") == "api_error" and _status_is_rate_limit(
+        envelope.get("api_error_status")
+    ):
+        return True
+    result = envelope.get("result")
+    if isinstance(result, str) and _looks_like_rate_limit(result):
+        return True
+    return False
+
+
+def _raise_if_rate_limited(
+    envelope: dict[str, Any] | None, stderr_text: str
+) -> None:
+    if _envelope_is_rate_limited(envelope) or _looks_like_rate_limit(stderr_text):
+        raise ClaudeRateLimitError(log_hint="claude rate limited (429)")
 
 
 def _signal_process(proc: asyncio.subprocess.Process, sig: int) -> None:
@@ -545,6 +603,12 @@ class ClaudeRunner:
         # verbatim, because it can carry environment and prompt fragments.
         stderr_text = stderr.decode("utf-8", errors="replace")
 
+        # The real CLI writes a json / stream-json envelope and then exits
+        # rc=1 for a session limit. Parse first so a 429 is not swallowed
+        # by the generic non-zero-exit path.
+        envelope, parse_error = _load_envelope(stdout, stream_json=stream_json)
+        _raise_if_rate_limited(envelope, stderr_text)
+
         if returncode != 0:
             if _looks_like_auth_failure(stderr_text):
                 raise ClaudeAuthError(log_hint="claude reported an auth failure")
@@ -558,20 +622,14 @@ class ClaudeRunner:
         if not stdout.strip():
             raise ClaudeOutputError(log_hint="claude produced empty stdout")
 
-        if stream_json:
-            envelope = _result_event_from_stream(stdout)
-        else:
-            try:
-                envelope = json.loads(stdout.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise ClaudeOutputError(
-                    log_hint="claude stdout was not valid JSON"
-                ) from exc
+        if parse_error is not None:
+            raise parse_error
 
         if not isinstance(envelope, dict):
             raise ClaudeOutputError(log_hint="claude envelope was not an object")
 
         if envelope.get("is_error") or envelope.get("subtype") not in (None, "success"):
+            _raise_if_rate_limited(envelope, stderr_text)
             if _looks_like_auth_failure(str(envelope.get("api_error_status") or "")):
                 raise ClaudeAuthError(log_hint="claude envelope reported auth failure")
             _LOG.error(
@@ -685,6 +743,33 @@ class ClaudeRunner:
             raise
 
         return proc.returncode, out, err
+
+
+def _load_envelope(
+    stdout: bytes, *, stream_json: bool
+) -> tuple[dict[str, Any] | None, ClaudeOutputError | None]:
+    """Best-effort parse of a json / stream-json result envelope.
+
+    A parse failure is returned rather than raised so a non-zero exit can
+    still be classified as a rate limit or auth error from stderr. The
+    caller raises ``parse_error`` only after those checks, and only on a
+    successful exit.
+    """
+    if not stdout.strip():
+        return None, None
+
+    try:
+        if stream_json:
+            return _result_event_from_stream(stdout), None
+        envelope = json.loads(stdout.decode("utf-8"))
+    except ClaudeOutputError as exc:
+        return None, exc
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, ClaudeOutputError(log_hint="claude stdout was not valid JSON")
+
+    if not isinstance(envelope, dict):
+        return None, ClaudeOutputError(log_hint="claude envelope was not an object")
+    return envelope, None
 
 
 def _result_event_from_stream(stdout: bytes) -> dict[str, Any]:

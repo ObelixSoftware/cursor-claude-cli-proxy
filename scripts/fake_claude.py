@@ -16,6 +16,7 @@ Modes (``FAKE_CLAUDE_MODE``):
 ``empty``         write nothing to stdout
 ``nonzero``       exit non-zero with generic stderr
 ``auth_fail``     exit non-zero with auth-flavoured stderr
+``rate_limit``    exit non-zero with a 429 session-limit envelope
 ``oversized``     emit a very large result string
 ``hang``          sleep far longer than any test timeout
 ``hang_with_child`` as ``hang``, but first spawn a grandchild that also sleeps
@@ -229,6 +230,26 @@ def main() -> int:
 
     if mode == "auth_fail":
         sys.stderr.write("Error: not logged in. Please log in with /login\n")
+        return 1
+
+    if mode == "rate_limit":
+        # Mirrors the real CLI: a stream-json / json result envelope with
+        # is_error, api_error_status 429, subtype still "success", a
+        # session-limit result string, then rc=1. The proxy must classify
+        # this and must never echo the reset clock to a client.
+        envelope = dict(ENVELOPE_BASE)
+        envelope["is_error"] = True
+        envelope["subtype"] = "success"
+        envelope["api_error_status"] = 429
+        envelope["result"] = (
+            "You've hit your session limit · resets 1:10pm (Africa/Johannesburg)"
+        )
+        envelope["rate_limit_event"] = {
+            "type": "rate_limit_event",
+            "rateLimitType": "five_hour",
+            "status": "rejected",
+        }
+        _write_envelope(envelope)
         return 1
 
     if mode == "prose":

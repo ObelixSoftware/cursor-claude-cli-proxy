@@ -4,8 +4,9 @@
 
 This release lets Cursor's `/multitask` fan out across several Claude Code CLI
 processes at once, shows how many agents are running, replaces a running agent
-when you edit its prompt, and guarantees every finished agent's process tree is
-killed.
+when you edit its prompt, guarantees every finished agent's process tree is
+killed, and maps a Claude Code session / usage limit to a Cursor-visible HTTP
+429 instead of a generic 502.
 
 ### What's New
 
@@ -39,10 +40,25 @@ its own process group. On success, timeout, cancellation, client disconnect and
 supersede, the proxy signals the whole group (SIGTERM, 5 s grace, then SIGKILL).
 Children spawned by the CLI can no longer outlive their request.
 
+#### Claude session limits are HTTP 429, not a generic 502
+When Claude Code is over its five-hour session limit it still writes a
+json / stream-json envelope (`api_error_status` 429, `is_error`) and exits
+rc=1. That used to become `ClaudeProcessError` — HTTP 502, "The Claude Code
+CLI exited unsuccessfully" — so Cursor showed a blank or failed turn with no
+useful reason.
+
+It is now `ClaudeRateLimitError`: HTTP **429**, OpenAI type / code
+`rate_limit_error`, with a fixed client message Cursor can display. The CLI's
+reset clock and other dynamic result text are classified, never echoed.
+Non-streaming and Cursor-bound stream requests both return that 429 JSON via
+the existing `ProxyError` handler when the CLI errors before any tokens —
+streaming does not open SSE 200 with an in-band error Cursor ignores. Auth
+failures stay **502** `ClaudeAuthError`; a 429 is not treated as auth.
+
 ### Version Bump
 - **From:** 1.1.0 (text + images)
 - **To:** 1.2.0 (parallel `/multitask` agents, prompt-edit supersede, console
-  agent count, process-group reap)
+  agent count, process-group reap, Cursor-visible 429 session-limit errors)
 
 `src/cli_proxy/__init__.py` had drifted to `0.1.0` while `pyproject.toml` said
 `1.1.0`; both now report `1.2.0`, as does `/health`.
@@ -65,12 +81,16 @@ serialised behaviour.
   first-message edit relies on the editor aborting the previous HTTP stream,
   which the existing disconnect handling already reaps.
 - **Streaming is still buffered.** Unchanged from 1.1.0.
+- **Session-limit reset times are not forwarded.** Cursor sees a fixed
+  message, not Claude's "resets 1:10pm" clock.
 
 ### Files Changed
 - `pyproject.toml`, `src/cli_proxy/__init__.py` - version 1.2.0
 - `src/cli_proxy/config.py` - `DEFAULT_MAX_CONCURRENCY` 1 to 4
 - `src/cli_proxy/claude_runner.py` - agent registry, conversation keys,
-  supersede, process-group reaping, agent-count logging
+  supersede, process-group reaping, agent-count logging, 429 session-limit
+  classification
+- `src/cli_proxy/errors.py` - `ClaudeRateLimitError`
 - `src/cli_proxy/app.py` - pass the conversation key through, report
   `agents_running` on `/health`
 - `src/cli_proxy/normalize.py` - conversation key derived from the request

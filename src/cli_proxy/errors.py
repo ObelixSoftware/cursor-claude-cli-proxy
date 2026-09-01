@@ -85,6 +85,15 @@ class ClaudeAuthError(ProxyError):
     )
 
 
+class ClaudeRateLimitError(ProxyError):
+    status_code = 429
+    error_type = "rate_limit_error"
+    client_message = (
+        "The Claude Code CLI has hit its usage limit. Wait until the session "
+        "resets, or sign in with another Claude account, then retry."
+    )
+
+
 class ClaudeTimeoutError(ProxyError):
     status_code = 504
     error_type = "api_error"
