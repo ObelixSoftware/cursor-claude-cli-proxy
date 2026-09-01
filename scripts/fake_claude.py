@@ -16,8 +16,10 @@ Modes (``FAKE_CLAUDE_MODE``):
 ``empty``         write nothing to stdout
 ``nonzero``       exit non-zero with generic stderr
 ``auth_fail``     exit non-zero with auth-flavoured stderr
+``rate_limit``    exit non-zero with a 429 session-limit envelope
 ``oversized``     emit a very large result string
 ``hang``          sleep far longer than any test timeout
+``hang_with_child`` as ``hang``, but first spawn a grandchild that also sleeps
 ``schema_break``  succeed with structured output that violates the contract
 
 ``FAKE_CLAUDE_DELAY_SECONDS`` delays the reply in every mode, which is how the
@@ -28,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -203,6 +206,17 @@ def main() -> int:
         time.sleep(600)
         return 0
 
+    if mode == "hang_with_child":
+        # Spawns a grandchild that outlives a signal aimed at this process
+        # alone, so the tests can prove the whole process group is reaped.
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+        pid_path = os.environ.get("FAKE_CLAUDE_CHILD_PID_FILE")
+        if pid_path:
+            with open(pid_path, "w", encoding="utf-8") as handle:
+                handle.write(str(child.pid))
+        time.sleep(600)
+        return 0
+
     if mode == "empty":
         return 0
 
@@ -216,6 +230,26 @@ def main() -> int:
 
     if mode == "auth_fail":
         sys.stderr.write("Error: not logged in. Please log in with /login\n")
+        return 1
+
+    if mode == "rate_limit":
+        # Mirrors the real CLI: a stream-json / json result envelope with
+        # is_error, api_error_status 429, subtype still "success", a
+        # session-limit result string, then rc=1. The proxy must classify
+        # this and must never echo the reset clock to a client.
+        envelope = dict(ENVELOPE_BASE)
+        envelope["is_error"] = True
+        envelope["subtype"] = "success"
+        envelope["api_error_status"] = 429
+        envelope["result"] = (
+            "You've hit your session limit · resets 1:10pm (Africa/Johannesburg)"
+        )
+        envelope["rate_limit_event"] = {
+            "type": "rate_limit_event",
+            "rateLimitType": "five_hour",
+            "status": "rejected",
+        }
+        _write_envelope(envelope)
         return 1
 
     if mode == "prose":

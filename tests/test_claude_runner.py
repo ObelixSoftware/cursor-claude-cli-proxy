@@ -20,6 +20,8 @@ from cli_proxy.claude_runner import (
     ClaudeRunner,
     _auth_status_is_logged_in,
     _looks_like_auth_failure,
+    _looks_like_rate_limit,
+    _status_is_rate_limit,
     _structured_from_result,
     _subprocess_env,
 )
@@ -27,6 +29,7 @@ from cli_proxy.errors import (
     ClaudeAuthError,
     ClaudeOutputError,
     ClaudeProcessError,
+    ClaudeRateLimitError,
     ClaudeTimeoutError,
     ClaudeUnavailableError,
     ResponseTooLargeError,
@@ -231,6 +234,75 @@ async def test_auth_failure_maps_to_502_with_guidance(runner: ClaudeRunner, fake
     with pytest.raises(ClaudeAuthError) as excinfo:
         await runner.run(PROMPT, "sonnet")
     assert "claude auth status" in excinfo.value.client_message
+    assert excinfo.value.status_code == 502
+    assert not isinstance(excinfo.value, ClaudeRateLimitError)
+
+
+async def test_rate_limit_maps_to_429_with_fixed_message(
+    runner: ClaudeRunner, fake_mode
+):
+    fake_mode("rate_limit")
+    with pytest.raises(ClaudeRateLimitError) as excinfo:
+        await runner.run(PROMPT, "sonnet")
+    error = excinfo.value
+    assert error.status_code == 429
+    assert error.error_type == "rate_limit_error"
+    assert error.client_message == ClaudeRateLimitError.client_message
+    assert error.log_hint == "claude rate limited (429)"
+    assert "1:10pm" not in error.client_message
+    assert "Johannesburg" not in error.client_message
+    assert "You've hit your" not in error.client_message
+
+
+async def test_rate_limit_is_not_classified_as_auth(runner: ClaudeRunner, fake_mode):
+    fake_mode("rate_limit")
+    with pytest.raises(ClaudeRateLimitError):
+        await runner.run(PROMPT, "sonnet")
+
+
+async def test_rate_limit_stream_json_envelope_is_detected(runner: ClaudeRunner):
+    """Image requests parse the terminal stream-json result, not one JSON object."""
+    result = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": True,
+        "api_error_status": "429",
+        "terminal_reason": "api_error",
+        "result": "You've hit your session limit · resets 1:10pm (Africa/Johannesburg)",
+    }
+    stdout = (
+        json.dumps({"type": "system", "subtype": "init"})
+        + "\n"
+        + json.dumps(result)
+        + "\n"
+    ).encode()
+    with pytest.raises(ClaudeRateLimitError) as excinfo:
+        runner._parse_envelope(stdout, b"", 1, stream_json=True)
+    assert excinfo.value.client_message == ClaudeRateLimitError.client_message
+    assert "Johannesburg" not in excinfo.value.client_message
+
+
+async def test_rate_limit_image_request_uses_stream_json_envelope(
+    runner: ClaudeRunner, fake_mode
+):
+    fake_mode("rate_limit")
+    image = ImageAttachment(media_type="image/png", data="AAAA")
+    with pytest.raises(ClaudeRateLimitError) as excinfo:
+        await runner.run(PROMPT, "sonnet", images=[image])
+    assert excinfo.value.client_message == ClaudeRateLimitError.client_message
+    assert "Johannesburg" not in excinfo.value.client_message
+
+
+async def test_rate_limit_json_envelope_is_detected_on_zero_exit(runner: ClaudeRunner):
+    envelope = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": True,
+        "api_error_status": 429,
+        "result": "You've hit your session limit · resets 1:10pm (Africa/Johannesburg)",
+    }
+    with pytest.raises(ClaudeRateLimitError):
+        runner._parse_envelope(json.dumps(envelope).encode(), b"", 0)
 
 
 async def test_invalid_json_maps_to_output_error(runner: ClaudeRunner, fake_mode):
@@ -379,6 +451,39 @@ def test_auth_failure_detection(text):
 
 def test_auth_failure_detection_ignores_unrelated_errors():
     assert not _looks_like_auth_failure("ENOENT: no such file")
+    assert not _looks_like_auth_failure("429")
+    assert not _looks_like_auth_failure(
+        "You've hit your session limit · resets 1:10pm (Africa/Johannesburg)"
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "You've hit your session limit · resets 1:10pm (Africa/Johannesburg)",
+        "session limit",
+        "rate_limit_event rejected",
+        "rate limit exceeded",
+    ],
+)
+def test_rate_limit_detection(text):
+    assert _looks_like_rate_limit(text)
+    assert not _looks_like_auth_failure(text)
+
+
+def test_rate_limit_detection_ignores_unrelated_errors():
+    assert not _looks_like_rate_limit("ENOENT: no such file")
+    assert not _looks_like_rate_limit("Error: not logged in. Please log in with /login")
+
+
+@pytest.mark.parametrize("value", [429, "429", " 429 "])
+def test_status_is_rate_limit_accepts_int_or_string(value):
+    assert _status_is_rate_limit(value)
+
+
+@pytest.mark.parametrize("value", [None, "", 401, "401", "ok", 500])
+def test_status_is_rate_limit_rejects_other_values(value):
+    assert not _status_is_rate_limit(value)
 
 
 def test_auth_status_parsing_returns_only_a_boolean():

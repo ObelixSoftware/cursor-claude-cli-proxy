@@ -7,6 +7,7 @@ import json
 import httpx
 import pytest
 
+from cli_proxy.errors import ClaudeAuthError, ClaudeRateLimitError
 from tests.conftest import AUTH_HEADERS
 
 
@@ -145,6 +146,33 @@ async def test_stateless_invocation_never_uses_continue(
     assert "--resume" not in argv
     assert "--session-id" not in argv
     assert "--no-session-persistence" in argv
+
+
+RATE_LIMIT_LEAKS = ("1:10pm", "Johannesburg", "You've hit your", "Africa/")
+
+
+async def test_rate_limit_maps_to_http_429(client: httpx.AsyncClient, fake_mode):
+    fake_mode("rate_limit")
+    body = {"model": "claude-cli-proxy", "messages": [{"role": "user", "content": "hi"}]}
+    response = await client.post("/v1/chat/completions", json=body, headers=AUTH_HEADERS)
+    assert response.status_code == 429
+    error = response.json()["error"]
+    assert error["type"] == "rate_limit_error"
+    assert error["code"] == "rate_limit_error"
+    assert error["message"] == ClaudeRateLimitError.client_message
+    for leak in RATE_LIMIT_LEAKS:
+        assert leak not in error["message"]
+
+
+async def test_auth_failure_is_still_502(client: httpx.AsyncClient, fake_mode):
+    fake_mode("auth_fail")
+    body = {"model": "claude-cli-proxy", "messages": [{"role": "user", "content": "hi"}]}
+    response = await client.post("/v1/chat/completions", json=body, headers=AUTH_HEADERS)
+    assert response.status_code == 502
+    error = response.json()["error"]
+    assert error["type"] == "api_error"
+    assert error["code"] == "api_error"
+    assert error["message"] == ClaudeAuthError.client_message
 
 
 async def test_structured_model_error_maps_to_502(client: httpx.AsyncClient, fake_mode):

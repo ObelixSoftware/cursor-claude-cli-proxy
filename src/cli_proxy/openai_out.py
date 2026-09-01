@@ -1,11 +1,11 @@
 """Construction of OpenAI-shaped responses and server-sent event streams.
 
-Streaming here is **buffered in content but not in connection**: the stream is
-opened and its first events are emitted before Claude is invoked, then the
-finished answer arrives in one burst rather than token by token. The two stream
-builders in this module split that into ``opening()``, ``heartbeat()`` and
-``body()`` so the caller can hold the connection open while the CLI runs.
-See ``LIMITATIONS.md``.
+Streaming here is **buffered**: the CLI is awaited to completion first so a
+rate-limit or process failure can still be an HTTP 429/502. Only a successful
+decision opens the event stream, which then emits the finished answer in one
+burst. The builders still split that into ``opening()``, ``heartbeat()`` and
+``body()`` (plus ``failure()`` if a chunk has already gone out). See
+``LIMITATIONS.md``.
 """
 
 from __future__ import annotations
@@ -146,9 +146,8 @@ def build_chat_completion(
 class ChatStreamBuilder:
     """Builds a ``chat.completion.chunk`` stream in three separable stages.
 
-    ``opening()`` can be emitted before Claude has been asked anything, which is
-    what lets the HTTP response start immediately. All stages share one
-    completion id and one ``created`` timestamp.
+    ``opening()`` is the role delta. All stages share one completion id and
+    one ``created`` timestamp.
     """
 
     def __init__(self, model_id: str) -> None:
@@ -364,8 +363,7 @@ class ResponseStreamBuilder:
     """Builds a Responses API event stream in three separable stages.
 
     ``opening()`` emits ``response.created`` and ``response.in_progress``, both
-    of which are well defined before any output exists, so they can go out
-    before Claude is invoked.
+    of which are well defined before any output items exist.
     """
 
     def __init__(

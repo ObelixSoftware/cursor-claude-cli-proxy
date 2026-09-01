@@ -85,6 +85,15 @@ class ClaudeAuthError(ProxyError):
     )
 
 
+class ClaudeRateLimitError(ProxyError):
+    status_code = 429
+    error_type = "rate_limit_error"
+    client_message = (
+        "The Claude Code CLI has hit its usage limit. Wait until the session "
+        "resets, or sign in with another Claude account, then retry."
+    )
+
+
 class ClaudeTimeoutError(ProxyError):
     status_code = 504
     error_type = "api_error"
@@ -116,6 +125,20 @@ class ClientDisconnectedError(ProxyError):
     status_code = 499
     error_type = "api_error"
     client_message = "The client disconnected before the response was produced."
+
+
+class AgentSupersededError(ProxyError):
+    """A newer request for the same conversation replaced this one.
+
+    ``claude --print`` cannot be handed a new prompt mid-run, so an edited
+    prompt is applied by killing this invocation and starting another.
+    """
+
+    status_code = 409
+    error_type = "api_error"
+    client_message = (
+        "This request was superseded by a newer prompt for the same conversation."
+    )
 
 
 class UpstreamModelError(ProxyError):

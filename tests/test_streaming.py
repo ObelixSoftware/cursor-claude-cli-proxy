@@ -11,7 +11,15 @@ import json
 
 import httpx
 
+from cli_proxy.errors import (
+    ClaudeAuthError,
+    ClaudeProcessError,
+    ClaudeRateLimitError,
+    UpstreamModelError,
+)
 from tests.conftest import AUTH_HEADERS
+
+RATE_LIMIT_LEAKS = ("1:10pm", "Johannesburg", "You've hit your", "Africa/")
 
 
 def parse_sse(raw: str) -> list[tuple[str | None, str]]:
@@ -199,14 +207,25 @@ async def test_responses_stream_carries_function_call_items(
 # -- error handling while streaming ---------------------------------------
 
 
-async def test_chat_stream_reports_a_late_failure_in_band(
+def _assert_openai_error(
+    response: httpx.Response,
+    *,
+    status_code: int,
+    error_type: str,
+    message: str,
+) -> None:
+    assert response.status_code == status_code
+    assert response.headers["content-type"].startswith("application/json")
+    error = response.json()["error"]
+    assert error["message"] == message
+    assert error["type"] == error_type
+    assert error["code"] == error_type
+
+
+async def test_chat_stream_process_error_is_http_502(
     client: httpx.AsyncClient, fake_mode
 ):
-    """The stream opens before Claude runs, so a CLI failure arrives in band.
-
-    An HTTP error status is no longer available once the 200 has been sent, so
-    the stream is closed cleanly and carries an ``error`` object instead.
-    """
+    """CLI failures are known before any token, so they stay HTTP errors."""
     fake_mode("nonzero")
     body = {
         "model": "claude-cli-proxy",
@@ -214,49 +233,29 @@ async def test_chat_stream_reports_a_late_failure_in_band(
         "stream": True,
     }
     response = await client.post("/v1/chat/completions", json=body, headers=AUTH_HEADERS)
-    assert response.status_code == 200
-    assert response.headers["content-type"].startswith("text/event-stream")
-
-    events = parse_sse(response.text)
-    assert events[-1][1] == "[DONE]"
-
-    payloads = [json.loads(data) for _, data in events[:-1]]
-    errors = [payload["error"] for payload in payloads if "error" in payload]
-    assert len(errors) == 1
-    assert errors[0]["type"] == "api_error"
-    assert "exited unsuccessfully" in errors[0]["message"]
-
-    finish_reasons = [
-        payload["choices"][0]["finish_reason"]
-        for payload in payloads
-        if payload.get("choices")
-    ]
-    assert finish_reasons[-1] == "stop"
+    _assert_openai_error(
+        response,
+        status_code=502,
+        error_type="api_error",
+        message=ClaudeProcessError.client_message,
+    )
 
 
-async def test_responses_stream_reports_a_late_failure_as_response_failed(
+async def test_responses_stream_process_error_is_http_502(
     client: httpx.AsyncClient, fake_mode
 ):
     fake_mode("nonzero")
     body = {"model": "claude-cli-proxy", "input": "hi", "stream": True}
     response = await client.post("/v1/responses", json=body, headers=AUTH_HEADERS)
-    assert response.status_code == 200
-
-    events = parse_sse(response.text)
-    assert events[-1][1] == "[DONE]"
-
-    named = [(name, json.loads(data)) for name, data in events[:-1]]
-    types = [name for name, _ in named]
-    assert types[0] == "response.created"
-    assert types[-1] == "response.failed"
-
-    failed = named[-1][1]["response"]
-    assert failed["status"] == "failed"
-    assert failed["error"]["code"] == "api_error"
-    assert "exited unsuccessfully" in failed["error"]["message"]
+    _assert_openai_error(
+        response,
+        status_code=502,
+        error_type="api_error",
+        message=ClaudeProcessError.client_message,
+    )
 
 
-async def test_model_structured_error_is_reported_in_band_when_streaming(
+async def test_model_structured_error_is_http_502_when_streaming(
     client: httpx.AsyncClient, fake_mode
 ):
     fake_mode("error", error="I will not do that")
@@ -266,12 +265,68 @@ async def test_model_structured_error_is_reported_in_band_when_streaming(
         "stream": True,
     }
     response = await client.post("/v1/chat/completions", json=body, headers=AUTH_HEADERS)
-    assert response.status_code == 200
+    _assert_openai_error(
+        response,
+        status_code=502,
+        error_type="api_error",
+        message="The model could not serve the request: I will not do that",
+    )
+    assert response.json()["error"]["type"] == UpstreamModelError.error_type
 
-    events = parse_sse(response.text)
-    payloads = [json.loads(data) for _, data in events[:-1]]
-    errors = [payload["error"] for payload in payloads if "error" in payload]
-    assert errors and "I will not do that" in errors[0]["message"]
+
+async def test_chat_stream_rate_limit_is_http_429(
+    client: httpx.AsyncClient, fake_mode
+):
+    """Cursor ignores in-band SSE errors; a pre-token 429 is an HTTP status."""
+    fake_mode("rate_limit")
+    body = {
+        "model": "claude-cli-proxy",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
+    }
+    response = await client.post("/v1/chat/completions", json=body, headers=AUTH_HEADERS)
+    _assert_openai_error(
+        response,
+        status_code=429,
+        error_type="rate_limit_error",
+        message=ClaudeRateLimitError.client_message,
+    )
+    for leak in RATE_LIMIT_LEAKS:
+        assert leak not in response.text
+
+
+async def test_responses_stream_rate_limit_is_http_429(
+    client: httpx.AsyncClient, fake_mode
+):
+    fake_mode("rate_limit")
+    body = {"model": "claude-cli-proxy", "input": "hi", "stream": True}
+    response = await client.post("/v1/responses", json=body, headers=AUTH_HEADERS)
+    _assert_openai_error(
+        response,
+        status_code=429,
+        error_type="rate_limit_error",
+        message=ClaudeRateLimitError.client_message,
+    )
+    for leak in RATE_LIMIT_LEAKS:
+        assert leak not in response.text
+
+
+async def test_chat_stream_auth_failure_is_http_502(
+    client: httpx.AsyncClient, fake_mode
+):
+    fake_mode("auth_fail")
+    body = {
+        "model": "claude-cli-proxy",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
+    }
+    response = await client.post("/v1/chat/completions", json=body, headers=AUTH_HEADERS)
+    _assert_openai_error(
+        response,
+        status_code=502,
+        error_type="api_error",
+        message=ClaudeAuthError.client_message,
+    )
 
 
 async def test_non_streaming_failure_still_returns_a_json_http_error(

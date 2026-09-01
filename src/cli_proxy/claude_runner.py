@@ -28,15 +28,18 @@ from typing import Any
 from .config import Settings
 from .debug_dump import NULL_EXCHANGE, Exchange
 from .errors import (
+    AgentSupersededError,
     ClaudeAuthError,
     ClaudeOutputError,
     ClaudeProcessError,
+    ClaudeRateLimitError,
     ClaudeTimeoutError,
     ClaudeUnavailableError,
     ResponseTooLargeError,
 )
 from .logging_setup import get_logger
 from .images import ImageAttachment, encode_cli_stdin
+from .normalize import ConversationIdentity
 from .schema import ADAPTER_OUTPUT_SCHEMA, SchemaViolation, validate_adapter_output
 
 _LOG = get_logger()
@@ -105,6 +108,15 @@ _AUTH_FAILURE_MARKERS = (
     "401",
 )
 
+#: Markers used only to *classify* a session / usage limit. The matched text
+#: is never returned to a client and never written into logs.
+_RATE_LIMIT_MARKERS = (
+    "session limit",
+    "rate_limit",
+    "rate limit",
+    "you've hit your",
+)
+
 
 @dataclass(frozen=True)
 class ClaudeDecision:
@@ -143,13 +155,88 @@ def _looks_like_auth_failure(stderr_text: str) -> bool:
     return any(marker in lowered for marker in _AUTH_FAILURE_MARKERS)
 
 
-async def _terminate_process(proc: asyncio.subprocess.Process) -> None:
-    """SIGTERM, wait ``GRACE_PERIOD_SECONDS``, then SIGKILL."""
+def _looks_like_rate_limit(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in _RATE_LIMIT_MARKERS)
+
+
+def _status_is_rate_limit(value: Any) -> bool:
+    """True when ``api_error_status`` is HTTP 429, as an int or as ``"429"``."""
+    if value is None:
+        return False
+    if value == 429:
+        return True
+    text = str(value).strip()
+    if text == "429":
+        return True
+    try:
+        return int(text) == 429
+    except (TypeError, ValueError):
+        return False
+
+
+def _envelope_is_rate_limited(envelope: dict[str, Any] | None) -> bool:
+    """Detect a CLI session / usage limit from a parsed result envelope.
+
+    Prefer ``api_error_status == 429``. ``terminal_reason == "api_error"``
+    together with a 429 is treated the same way. Result text is classified
+    only; it is never echoed.
+    """
+    if not isinstance(envelope, dict):
+        return False
+    if _status_is_rate_limit(envelope.get("api_error_status")):
+        return True
+    if envelope.get("terminal_reason") == "api_error" and _status_is_rate_limit(
+        envelope.get("api_error_status")
+    ):
+        return True
+    result = envelope.get("result")
+    if isinstance(result, str) and _looks_like_rate_limit(result):
+        return True
+    return False
+
+
+def _raise_if_rate_limited(
+    envelope: dict[str, Any] | None, stderr_text: str
+) -> None:
+    if _envelope_is_rate_limited(envelope) or _looks_like_rate_limit(stderr_text):
+        raise ClaudeRateLimitError(log_hint="claude rate limited (429)")
+
+
+def _signal_process(proc: asyncio.subprocess.Process, sig: int) -> None:
+    """Signal the CLI's whole process group, falling back to the child alone.
+
+    The CLI is spawned with ``start_new_session=True``, so it leads its own
+    group and anything it spawns is in that group. Signalling the group is what
+    stops a child outliving the request that created it. The group id is
+    compared against our own before signalling, so a failed setsid can never
+    turn this into a signal against the proxy itself.
+    """
     if proc.returncode is not None:
         return
 
-    with contextlib.suppress(ProcessLookupError):
-        proc.terminate()
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, OSError):
+        pgid = None
+
+    if pgid is not None and pgid != os.getpgid(0):
+        try:
+            os.killpg(pgid, sig)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+    with contextlib.suppress(ProcessLookupError, OSError):
+        proc.send_signal(sig)
+
+
+async def _terminate_process(proc: asyncio.subprocess.Process) -> None:
+    """SIGTERM the process group, wait ``GRACE_PERIOD_SECONDS``, then SIGKILL."""
+    if proc.returncode is not None:
+        return
+
+    _signal_process(proc, signal.SIGTERM)
 
     try:
         await asyncio.wait_for(proc.wait(), timeout=GRACE_PERIOD_SECONDS)
@@ -163,23 +250,152 @@ async def _terminate_process(proc: asyncio.subprocess.Process) -> None:
     except ProcessLookupError:
         return
 
-    with contextlib.suppress(ProcessLookupError):
-        proc.send_signal(signal.SIGKILL)
+    _signal_process(proc, signal.SIGKILL)
     with contextlib.suppress(Exception):
         await proc.wait()
 
 
+class _Agent:
+    """One in-flight invocation, tracked so it can be counted and replaced."""
+
+    def __init__(self, identity: ConversationIdentity | None) -> None:
+        self.identity = identity
+        self.process: asyncio.subprocess.Process | None = None
+        self.superseded = False
+        self._replaced = asyncio.Event()
+
+    @property
+    def turn_signature(self) -> str:
+        return self.identity.turn_signature if self.identity else ""
+
+    async def supersede(self) -> None:
+        """Mark this agent replaced and reap whatever it is running."""
+        self.superseded = True
+        self._replaced.set()
+        proc = self.process
+        if proc is not None:
+            await _terminate_process(proc)
+
+    async def wait_superseded(self) -> None:
+        """Block until this agent is superseded. Used to interrupt a queue wait."""
+        await self._replaced.wait()
+
+    def raise_if_superseded(self) -> None:
+        if self.superseded:
+            raise AgentSupersededError(log_hint="agent superseded by a newer prompt")
+
+
 class ClaudeRunner:
-    """Owns concurrency limiting and argv construction for the CLI."""
+    """Owns concurrency limiting, argv construction and the in-flight agents.
+
+    Cursor's ``/multitask`` opens several ordinary HTTP requests at once, so
+    "an agent" here is simply one invocation in flight. The registry exists for
+    three reasons: to report how many are running, to find the invocation an
+    edited prompt should replace, and to guarantee every process is reaped.
+    """
 
     def __init__(self, settings: Settings, system_prompt: str) -> None:
         self._settings = settings
         self._system_prompt = system_prompt
         self._semaphore = asyncio.Semaphore(settings.max_concurrency)
+        self._agents_by_key: dict[str, _Agent] = {}
+        self._agents_running = 0
 
     @property
     def settings(self) -> Settings:
         return self._settings
+
+    @property
+    def agents_running(self) -> int:
+        """How many Claude CLI processes are executing right now."""
+        return self._agents_running
+
+    def log_agent_count(self) -> None:
+        """Emit the console line operators watch during ``/multitask``."""
+        _LOG.info(
+            "cli-proxy agents running: %d/%d",
+            self._agents_running,
+            self._settings.max_concurrency,
+        )
+
+    def _count_started(self) -> None:
+        self._agents_running += 1
+        self.log_agent_count()
+
+    def _count_finished(self) -> None:
+        self._agents_running = max(0, self._agents_running - 1)
+        self.log_agent_count()
+
+    async def _register(self, identity: ConversationIdentity | None) -> _Agent:
+        """Register a new agent, replacing an in-flight one whose prompt changed.
+
+        The map is swapped synchronously before anything is awaited, so two
+        requests arriving together cannot both decide they are the first.
+        """
+        agent = _Agent(identity)
+        if identity is None:
+            return agent
+
+        previous = self._agents_by_key.get(identity.key)
+        self._agents_by_key[identity.key] = agent
+
+        if previous is None or previous.turn_signature == identity.turn_signature:
+            # Same prompt still running: a duplicate or a retry, not an edit.
+            return agent
+
+        _LOG.info(
+            "prompt edited for a running agent; superseding key=%s pid=%s",
+            identity.key,
+            previous.process.pid if previous.process else "pending",
+        )
+        await previous.supersede()
+        return agent
+
+    def _unregister(self, agent: _Agent) -> None:
+        identity = agent.identity
+        if identity is None:
+            return
+        # Only clear the slot if a newer agent has not already claimed it.
+        if self._agents_by_key.get(identity.key) is agent:
+            del self._agents_by_key[identity.key]
+
+    async def _acquire_slot(self, agent: _Agent) -> None:
+        """Take a concurrency slot, abandoning the wait if the agent is superseded.
+
+        A plain ``Semaphore.acquire`` cannot be interrupted, so when every slot
+        is busy an agent whose prompt was edited while it queued would keep
+        waiting for a slot it is never going to use, and the client that edited
+        the prompt would be told nothing until some unrelated agent finished.
+        Racing the acquisition against the supersede signal means the stale
+        request fails immediately and never spawns a process.
+        """
+        agent.raise_if_superseded()
+
+        acquire = asyncio.ensure_future(self._semaphore.acquire())
+        replaced = asyncio.ensure_future(agent.wait_superseded())
+        try:
+            await asyncio.wait(
+                (acquire, replaced), return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            replaced.cancel()
+            # Cancelling an acquisition that already succeeded is a no-op, so
+            # the slot has to be handed back explicitly rather than assumed lost.
+            acquire.cancel()
+            held = (
+                acquire.done()
+                and not acquire.cancelled()
+                and acquire.exception() is None
+            )
+            if held and agent.superseded:
+                self._semaphore.release()
+                held = False
+
+        if not held:
+            # The wait only ends when one of the two finished, so losing the
+            # race means the agent was replaced.
+            agent.raise_if_superseded()
+            raise ClaudeProcessError(log_hint="failed to acquire a concurrency slot")
 
     def build_argv(self, model_alias: str, *, has_images: bool = False) -> list[str]:
         """Build the fixed argv for one invocation.
@@ -231,11 +447,14 @@ class ClaudeRunner:
         model_alias: str,
         exchange: Exchange | None = None,
         images: Sequence[ImageAttachment] | None = None,
+        identity: ConversationIdentity | None = None,
     ) -> ClaudeDecision:
         """Invoke the CLI once and return its validated decision.
 
         ``exchange`` is the optional debug recorder. It defaults to the no-op
-        one, so existing callers need no change.
+        one, so existing callers need no change. ``identity`` names the
+        conversation; passing it lets an edited prompt replace the invocation
+        that is already running for that conversation.
         """
         recorder = exchange or NULL_EXCHANGE
         attachments = list(images or ())
@@ -243,8 +462,20 @@ class ClaudeRunner:
         recorder.record_argv(argv)
         payload = encode_cli_stdin(prompt, attachments)
 
-        async with self._semaphore:
-            stdout, stderr, returncode = await self._exec(argv, payload, recorder)
+        agent = await self._register(identity)
+        try:
+            await self._acquire_slot(agent)
+            try:
+                # A prompt edit can land while this agent waits for a slot.
+                agent.raise_if_superseded()
+                stdout, stderr, returncode = await self._exec(
+                    argv, payload, recorder, agent
+                )
+            finally:
+                self._semaphore.release()
+            agent.raise_if_superseded()
+        finally:
+            self._unregister(agent)
 
         recorder.record_claude_result(
             stdout=stdout, stderr=stderr, returncode=returncode
@@ -260,6 +491,7 @@ class ClaudeRunner:
         argv: list[str],
         payload: bytes,
         exchange: Exchange | None = None,
+        agent: _Agent | None = None,
     ) -> tuple[bytes, bytes, int | None]:
         recorder = exchange or NULL_EXCHANGE
         limit = self._settings.max_response_bytes + (1024 * 1024)
@@ -272,6 +504,9 @@ class ClaudeRunner:
                 cwd=self._settings.working_dir,
                 env=_subprocess_env(),
                 limit=limit,
+                # Give the CLI its own process group so that reaping it also
+                # reaps anything it spawned.
+                start_new_session=True,
             )
         except FileNotFoundError as exc:
             raise ClaudeUnavailableError(log_hint="claude executable not found") from exc
@@ -282,44 +517,76 @@ class ClaudeRunner:
         except OSError as exc:
             raise ClaudeUnavailableError(log_hint="claude spawn failed") from exc
 
-        _LOG.info(
-            "claude subprocess started pid=%s model=%s timeout=%.0fs",
-            proc.pid,
-            argv[argv.index("--model") + 1],
-            self._settings.timeout_seconds,
-        )
-        recorder.record_note(f"claude subprocess started pid={proc.pid}")
+        if agent is not None:
+            agent.process = proc
+        self._count_started()
 
+        # Everything after the count goes up belongs inside the try, so that no
+        # failure between here and the wait can leave the total drifting.
         try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=payload),
-                timeout=self._settings.timeout_seconds,
+            _LOG.info(
+                "claude subprocess started pid=%s model=%s timeout=%.0fs",
+                proc.pid,
+                argv[argv.index("--model") + 1],
+                self._settings.timeout_seconds,
             )
-        except (TimeoutError, asyncio.TimeoutError) as exc:
-            recorder.record_note(f"claude subprocess pid={proc.pid} timed out")
-            await _terminate_process(proc)
-            _LOG.warning("claude subprocess pid=%s timed out", proc.pid)
-            raise ClaudeTimeoutError(log_hint="claude timed out") from exc
-        except asyncio.CancelledError:
-            # Client disconnected, or the server is shutting down.
-            recorder.record_note(f"claude subprocess pid={proc.pid} cancelled")
-            await _terminate_process(proc)
-            _LOG.info("claude subprocess pid=%s cancelled; process reaped", proc.pid)
-            raise
-        except ValueError as exc:
-            # asyncio raises this when a stream exceeds its buffer limit.
-            recorder.record_note(f"claude subprocess pid={proc.pid} exceeded stream limit")
-            await _terminate_process(proc)
-            raise ResponseTooLargeError(log_hint="claude stdout over stream limit") from exc
+            recorder.record_note(f"claude subprocess started pid={proc.pid}")
 
-        _LOG.info(
-            "claude subprocess pid=%s exited rc=%s stdout_bytes=%d stderr_bytes=%d",
-            proc.pid,
-            proc.returncode,
-            len(stdout),
-            len(stderr),
-        )
-        return stdout, stderr, proc.returncode
+            if agent is not None and agent.superseded:
+                # Superseded between the spawn and the first await.
+                await _terminate_process(proc)
+                raise AgentSupersededError(log_hint="agent superseded by a newer prompt")
+
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(input=payload),
+                    timeout=self._settings.timeout_seconds,
+                )
+            except (TimeoutError, asyncio.TimeoutError) as exc:
+                recorder.record_note(f"claude subprocess pid={proc.pid} timed out")
+                await _terminate_process(proc)
+                _LOG.warning("claude subprocess pid=%s timed out", proc.pid)
+                raise ClaudeTimeoutError(log_hint="claude timed out") from exc
+            except asyncio.CancelledError:
+                # Client disconnected, or the server is shutting down.
+                recorder.record_note(f"claude subprocess pid={proc.pid} cancelled")
+                await _terminate_process(proc)
+                _LOG.info("claude subprocess pid=%s cancelled; process reaped", proc.pid)
+                raise
+            except ValueError as exc:
+                # asyncio raises this when a stream exceeds its buffer limit.
+                recorder.record_note(
+                    f"claude subprocess pid={proc.pid} exceeded stream limit"
+                )
+                await _terminate_process(proc)
+                raise ResponseTooLargeError(
+                    log_hint="claude stdout over stream limit"
+                ) from exc
+
+            if agent is not None and agent.superseded:
+                await _terminate_process(proc)
+                raise AgentSupersededError(log_hint="agent superseded by a newer prompt")
+
+            _LOG.info(
+                "claude subprocess pid=%s exited rc=%s stdout_bytes=%d stderr_bytes=%d",
+                proc.pid,
+                proc.returncode,
+                len(stdout),
+                len(stderr),
+            )
+            return stdout, stderr, proc.returncode
+        finally:
+            try:
+                # A normal exit has already reaped the process; this catches the
+                # case where the CLI answered but left the group alive.
+                if proc.returncode is None:
+                    await _terminate_process(proc)
+            finally:
+                # The count must fall even if reaping is itself interrupted,
+                # otherwise the console total drifts upward forever.
+                if agent is not None:
+                    agent.process = None
+                self._count_finished()
 
     def _parse_envelope(
         self,
@@ -336,6 +603,12 @@ class ClaudeRunner:
         # verbatim, because it can carry environment and prompt fragments.
         stderr_text = stderr.decode("utf-8", errors="replace")
 
+        # The real CLI writes a json / stream-json envelope and then exits
+        # rc=1 for a session limit. Parse first so a 429 is not swallowed
+        # by the generic non-zero-exit path.
+        envelope, parse_error = _load_envelope(stdout, stream_json=stream_json)
+        _raise_if_rate_limited(envelope, stderr_text)
+
         if returncode != 0:
             if _looks_like_auth_failure(stderr_text):
                 raise ClaudeAuthError(log_hint="claude reported an auth failure")
@@ -349,20 +622,14 @@ class ClaudeRunner:
         if not stdout.strip():
             raise ClaudeOutputError(log_hint="claude produced empty stdout")
 
-        if stream_json:
-            envelope = _result_event_from_stream(stdout)
-        else:
-            try:
-                envelope = json.loads(stdout.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise ClaudeOutputError(
-                    log_hint="claude stdout was not valid JSON"
-                ) from exc
+        if parse_error is not None:
+            raise parse_error
 
         if not isinstance(envelope, dict):
             raise ClaudeOutputError(log_hint="claude envelope was not an object")
 
         if envelope.get("is_error") or envelope.get("subtype") not in (None, "success"):
+            _raise_if_rate_limited(envelope, stderr_text)
             if _looks_like_auth_failure(str(envelope.get("api_error_status") or "")):
                 raise ClaudeAuthError(log_hint="claude envelope reported auth failure")
             _LOG.error(
@@ -476,6 +743,33 @@ class ClaudeRunner:
             raise
 
         return proc.returncode, out, err
+
+
+def _load_envelope(
+    stdout: bytes, *, stream_json: bool
+) -> tuple[dict[str, Any] | None, ClaudeOutputError | None]:
+    """Best-effort parse of a json / stream-json result envelope.
+
+    A parse failure is returned rather than raised so a non-zero exit can
+    still be classified as a rate limit or auth error from stderr. The
+    caller raises ``parse_error`` only after those checks, and only on a
+    successful exit.
+    """
+    if not stdout.strip():
+        return None, None
+
+    try:
+        if stream_json:
+            return _result_event_from_stream(stdout), None
+        envelope = json.loads(stdout.decode("utf-8"))
+    except ClaudeOutputError as exc:
+        return None, exc
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, ClaudeOutputError(log_hint="claude stdout was not valid JSON")
+
+    if not isinstance(envelope, dict):
+        return None, ClaudeOutputError(log_hint="claude envelope was not an object")
+    return envelope, None
 
 
 def _result_event_from_stream(stdout: bytes) -> dict[str, Any]:

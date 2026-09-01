@@ -36,46 +36,35 @@ inert. All real tool execution stays with the editor.
 
 ## 2. Streaming is buffered
 
-The connection opens immediately; the *text* does not stream token by token.
+The *text* does not stream token by token. The proxy waits for the finished
+`claude --print` envelope before opening SSE, so a session-limit or process
+failure can still be an HTTP 429/502 that Cursor will render.
 
 For `"stream": true` the proxy:
 
-1. sends HTTP 200 and the opening event(s) straight away -- the
-   `{"role":"assistant","content":""}` delta for Chat Completions, or
-   `response.created` and `response.in_progress` for the Responses API;
-2. emits an SSE comment keepalive (`: keepalive`) every 7 seconds while the CLI
-   runs, which every conforming SSE client ignores;
-3. emits the entire answer in one burst when the CLI finishes, then the finish
-   chunk and `data: [DONE]`.
+1. awaits the CLI envelope (same as a non-streaming request);
+2. on a CLI / model error before any assistant token, returns the same
+   OpenAI-shaped JSON error as non-stream -- HTTP **429** for a session limit,
+   **502** for auth or process failure -- and does **not** open SSE;
+3. on success, sends HTTP 200 and the opening event(s), then the entire answer
+   in one burst, then the finish chunk and `data: [DONE]`.
 
-Measured locally against Claude Code 2.1.231: time to first byte 1.2 ms, full
-answer 15.8 s. Before this design, time to first byte *was* the full model
-latency, which is a reliable way to trip a client's first-byte timeout and
-render nothing at all.
+A 200 stream with an in-band `data: {"error": ...}` looks like a crash or
+blank turn in Cursor Agent, so the proxy refuses to open SSE when it already
+knows the CLI failed. If a chunk has already gone out and something then
+fails, the stream is closed in band (`data: {"error": ...}` /
+`response.failed`). Rate-limit envelopes from Claude have no assistant text,
+so the pre-stream 429 path covers that case. Claude's reset clock is never
+forwarded.
 
-**What it means for you:** the editor shows the request as live within
-milliseconds, then the reply appears all at once rather than typing itself out.
-There is no partial-token streaming, and there is no progress indication beyond
-the keepalives. This is inherent to `claude --print`, which writes its JSON
-envelope only on completion.
+Time-to-first-byte is therefore the full model latency. That can trip a
+client's first-byte timeout on a long turn; it is the trade-off for making
+errors visible in Cursor.
 
-### Errors while streaming
-
-Once the 200 has been sent, an HTTP error status is no longer available. A
-failure that happens *after* the stream opened is reported in band:
-
-* Chat Completions: a chunk with `finish_reason: "stop"`, then
-  `data: {"error": {...}}`, then `data: [DONE]`.
-* Responses: a `response.failed` event whose `response.error` carries the
-  reason, then `data: [DONE]`.
-
-Failures detected *before* the stream opens -- authentication, oversized body,
-malformed JSON, unsupported content -- still return an ordinary HTTP 4xx/5xx
-JSON error, as do all non-streaming requests.
-
-**What it means for you:** a strict OpenAI client will raise on the in-band
-error object; a lenient one may show an empty reply instead of an error. Check
-the proxy's log or a debug dump if a streamed turn comes back blank.
+**What it means for you:** the reply appears all at once rather than typing
+itself out. There is no partial-token streaming. This is inherent to
+`claude --print`, which writes its JSON envelope only on completion. A
+session-limit turn should show the fixed 429 message, not a blank reply.
 
 ## 3. Images are accepted; audio and files are not
 
@@ -120,9 +109,23 @@ has not been automatically verified and needs a human to confirm.
 
 ## 5. Other operational limits
 
-* **One request at a time by default.** `CLAUDE_MAX_CONCURRENCY` defaults to 1.
-  A second request queues behind the first. Each Claude invocation is a full
-  process launch, so raising this multiplies memory and token cost.
+* **Up to N concurrent CLI processes (default 4).**
+  `CLAUDE_MAX_CONCURRENCY` defaults to 4 so Cursor `/multitask` can run
+  several agents at once. Further requests wait on the semaphore. Each
+  invocation is a full process-group launch, so raising this multiplies
+  memory and token cost. The console prints `cli-proxy agents running: N/M`
+  on every change. When an agent finishes, is cancelled, times out, or is
+  superseded, the proxy signals the whole process group (SIGTERM, 5 s,
+  SIGKILL) so child processes do not leak. The reasoning behind the default
+  of 4 is written out in the README, under "Why the concurrency default is
+  four" in §6.
+* **A prompt edit cannot be injected into a running `claude --print`.**
+  That command reads stdin once. If a later request has the same
+  conversation prefix and a different last user message, the in-flight
+  process group is killed and a new invocation starts with the updated
+  prompt. Brand-new first messages are not matched this way, so two
+  first-turn `/multitask` siblings do not cancel each other. First-message
+  edits depend on the editor aborting the previous HTTP stream.
 * **No conversation reuse.** `--continue` and `--resume` are never used and
   session persistence is off, so every request re-sends the whole conversation
   and re-pays for the prompt tokens.

@@ -11,6 +11,7 @@ to ``/v1/chat/completions``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from dataclasses import dataclass, field
@@ -562,6 +563,104 @@ def normalize_request(body: Any, *, flavor: ApiFlavor | None = None) -> Normaliz
     if detected == FLAVOR_CHAT:
         return normalize_chat_request(body)
     return normalize_responses_request(body)
+
+
+# ---------------------------------------------------------------------------
+# Conversation identity
+# ---------------------------------------------------------------------------
+
+#: Inbound fields that, when present, name the conversation directly. Cursor is
+#: not documented to send any of these, so the hashed prefix below is the path
+#: that actually runs in practice.
+_CONVERSATION_ID_FIELDS = ("conversation", "conversation_id", "session_id")
+
+
+@dataclass(frozen=True)
+class ConversationIdentity:
+    """Identifies which in-flight agent a request belongs to.
+
+    ``key`` is stable across the turns of one conversation. ``turn_signature``
+    changes when the latest user message changes, which is how an edited prompt
+    is told apart from a retry of the same one.
+
+    Neither value contains recoverable prompt text: both are digests.
+    """
+
+    key: str
+    turn_signature: str
+
+
+def derive_conversation_identity(
+    body: Any, request: NormalizedRequest
+) -> ConversationIdentity | None:
+    """Derive the supersede key for a request, or ``None`` if it has none.
+
+    ``None`` means "never replace another agent for this one". That covers a
+    brand-new conversation, whose empty prefix would otherwise collide with
+    every other brand-new conversation and let two ``/multitask`` siblings kill
+    each other on their first turn.
+    """
+    last_user = _last_user_index(request.turns)
+    if last_user is None:
+        return None
+
+    signature = _digest(
+        [_turn_material(turn) for turn in request.turns[last_user:]]
+    )
+
+    explicit = _explicit_conversation_id(body)
+    if explicit is not None:
+        return ConversationIdentity(key=f"id:{_digest([explicit])}", turn_signature=signature)
+
+    prefix = request.turns[:last_user]
+    if not prefix:
+        return None
+
+    material = [
+        request.requested_model or "",
+        ",".join(sorted(tool.name for tool in request.tools)),
+        *[_turn_material(turn) for turn in prefix],
+    ]
+    return ConversationIdentity(key=f"fp:{_digest(material)}", turn_signature=signature)
+
+
+def _explicit_conversation_id(body: Any) -> str | None:
+    if not isinstance(body, dict):
+        return None
+    for field_name in _CONVERSATION_ID_FIELDS:
+        value = _optional_str(body.get(field_name))
+        if value:
+            return value
+    metadata = body.get("metadata")
+    if isinstance(metadata, dict):
+        for field_name in _CONVERSATION_ID_FIELDS:
+            value = _optional_str(metadata.get(field_name))
+            if value:
+                return value
+    return None
+
+
+def _last_user_index(turns: list[Turn]) -> int | None:
+    for index in range(len(turns) - 1, -1, -1):
+        if turns[index].role == "user":
+            return index
+    return None
+
+
+def _turn_material(turn: Turn) -> str:
+    calls = ";".join(f"{call.name}:{call.arguments!r}" for call in turn.tool_calls)
+    images = ";".join(image.digest() for image in turn.images)
+    return "\x1f".join(
+        [turn.role, turn.text, turn.tool_call_id, turn.tool_name, calls, images]
+    )
+
+
+def _digest(parts: list[str]) -> str:
+    hasher = hashlib.sha256()
+    for part in parts:
+        hasher.update(part.encode("utf-8", errors="replace"))
+        hasher.update(b"\x1e")
+    return hasher.hexdigest()[:32]
 
 
 def _optional_str(value: Any) -> str | None:

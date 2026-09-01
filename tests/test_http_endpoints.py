@@ -33,8 +33,9 @@ async def test_health_reports_ok(client: httpx.AsyncClient, fake_mode):
     assert body["claude_executable_available"] is True
     assert body["claude_authenticated"] is True
     assert body["claude_version"] == "2.1.231 (Claude Code)"
-    assert body["proxy_version"] == "0.1.0"
+    assert body["proxy_version"] == "1.2.0"
     assert body["streaming"] == "buffered"
+    assert body["stream_opens_immediately"] is False
     assert body["models"] == [
         "claude-cli-proxy",
         "claude-cli-sonnet",

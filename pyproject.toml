@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cli-proxy"
-version = "1.1.0"
+version = "1.2.0"
 description = "Experimental OpenAI-compatible HTTP proxy that translates requests into non-interactive Claude Code CLI invocations."
 readme = "README.md"
 requires-python = ">=3.12"
