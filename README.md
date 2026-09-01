@@ -109,7 +109,10 @@ It shells out to `claude`, which uses whatever login state it already has.
 │          --json-schema <output contract>                            │
 │                                                                     │
 │   asyncio.create_subprocess_exec, never shell=True.                 │
-│   Timeout → SIGTERM → 5 s grace → SIGKILL.                          │
+│   start_new_session=True, so the CLI leads its own process group.   │
+│   Timeout, cancel, disconnect or supersede → SIGTERM the whole      │
+│   group → 5 s grace → SIGKILL.                                      │
+│   Up to CLAUDE_MAX_CONCURRENCY of these run concurrently.           │
 └─────────────────────────────────────────────────────────────────────┘
     │  JSON envelope on stdout; `structured_output` is the decision
     ▼
@@ -163,7 +166,7 @@ documented deviation from the original design intent; see
 | --- | --- |
 | `--bare` | Bare mode ignores subscription OAuth, so a claude.ai subscription would stop working. |
 | `--dangerously-skip-permissions` | Never used, under any configuration. |
-| `--continue` / `--resume` | Every request is a fresh, stateless invocation. Unrelated Cursor conversations cannot mix. Session persistence is off. |
+| `--continue` / `--resume` | Every request is a fresh, stateless invocation. Unrelated Cursor conversations cannot mix. Session persistence is off. A prompt *edit* is not a resume either: the old process group is killed and a new `--print` starts with the full updated conversation. |
 | `shell=True` | argv is a fixed list; no value can be reinterpreted as a shell token. |
 | Prompt on argv | The conversation goes over **stdin**, keeping it out of the process table and away from argv length limits. |
 
@@ -216,8 +219,14 @@ Full detail is in [`LIMITATIONS.md`](LIMITATIONS.md). The headlines:
   name (observed: `gpt-5.6-sol`), which is not one of the ids this proxy
   advertises. Unknown ids fall back to `CLAUDE_DEFAULT_MODEL`. See
   [§10](#10-configuring-cursor).
-- **One request at a time by default.** `CLAUDE_MAX_CONCURRENCY` defaults to 1;
-  a second request queues behind the first.
+- **Up to four Claude CLIs at once by default.** `CLAUDE_MAX_CONCURRENCY`
+  defaults to 4 so Cursor `/multitask` can fan out. A fifth request queues.
+  Each slot is a full process launch and re-pays the whole prompt, so raising
+  this multiplies memory and token cost. The proxy console prints
+  `cli-proxy agents running: N/M` whenever the count changes. Editing a
+  prompt on a still-running agent does not inject text into `claude --print`;
+  the matching process group is killed and a new invocation starts with the
+  updated conversation. See [§10](#10-configuring-cursor).
 - **`temperature` and `max_tokens` are hints, not limits.** They are described to
   the model in the prompt. The CLI exposes no flags for them.
 - **Debug dumps are cleartext.** See [§6](#6-configuration) and
@@ -356,8 +365,8 @@ All configuration is environment variables, read once at startup by
 | `CLI_PROXY_PORT` | `8787` | Listen port. Must be 1–65535. |
 | `CLAUDE_EXECUTABLE` | `claude` resolved on `PATH` | Path to the Claude Code CLI. A value containing a `/` is used as-is (expanding `~`); a bare name is resolved with `which`. **Its existence is not checked at startup** — see [§13](#13-troubleshooting). |
 | `CLAUDE_DEFAULT_MODEL` | `sonnet` | Claude model alias used for the `claude-cli-proxy` id and for any unrecognised model id. `sonnet`, `opus`, `haiku`, or a full model name. **In practice this is the only real control over which model serves Cursor.** |
-| `CLAUDE_TIMEOUT_SECONDS` | `600` | Wall-clock limit for one CLI invocation. On expiry: SIGTERM, 5 s grace, then SIGKILL, and HTTP 504. Minimum 1. |
-| `CLAUDE_MAX_CONCURRENCY` | `1` | Concurrent `claude` subprocesses. Each is a full process launch, so raising this multiplies memory and token cost. Minimum 1. |
+| `CLAUDE_TIMEOUT_SECONDS` | `600` | Wall-clock limit for one CLI invocation. On expiry the whole process group gets SIGTERM, 5 s grace, then SIGKILL, and the request returns HTTP 504. Minimum 1. |
+| `CLAUDE_MAX_CONCURRENCY` | `4` | Concurrent `claude` process groups. Defaults to 4 so Cursor `/multitask` can fan out; requests beyond that queue. Each slot is a full process launch that re-pays the whole prompt, so raising this multiplies memory and token cost. Minimum 1. See [why the default is four](#why-the-concurrency-default-is-four). |
 | `CLAUDE_WORKING_DIR` | *(blank)* | Working directory for the subprocess. Blank creates and uses a private empty scratch directory (`$TMPDIR/cli-proxy-scratch`, mode 0700). If set, it must already exist and be a directory or startup fails. Pointing it at a real project is not recommended. |
 | `CLI_PROXY_MAX_REQUEST_BYTES` | `4194304` (4 MiB) | Maximum accepted request body. `Content-Length` is checked first, then the streamed size. Over the limit → HTTP 413. Minimum 1024. |
 | `CLI_PROXY_MAX_RESPONSE_BYTES` | `4194304` (4 MiB) | Maximum accepted CLI stdout. Over the limit → HTTP 502. Minimum 1024. |
@@ -368,6 +377,36 @@ All configuration is environment variables, read once at startup by
 
 Booleans accept `1/true/yes/on` and `0/false/no/off`; anything else is a
 configuration error.
+
+### Why the concurrency default is four
+
+**Four is a judgement call, not a measured optimum for this proxy.** Nothing
+here was benchmarked to arrive at it. It is the number that makes Cursor's
+`/multitask` do anything at all without being obviously reckless.
+
+The argument for going above 1: Cursor typically decomposes a `/multitask`
+request into roughly three or four subagents, each of which arrives as an
+ordinary independent request. At `CLAUDE_MAX_CONCURRENCY=1` every one of those
+serialises behind the semaphore and the parallelism is purely cosmetic — you
+wait for the same total time you would have waited anyway. Four slots let a
+typical fan-out run without queuing.
+
+The argument against going higher is this proxy's own measured cost profile.
+It is stateless, so Cursor resends the entire conversation on every turn and
+every invocation re-pays for the whole prompt; two real captured Cursor turns
+reported **214,250** and **430,367** prompt tokens ([§3](#3-limitations)). Four
+concurrent turns are therefore on the order of one to 1.7 million prompt tokens
+in flight at the same moment. Each slot is also a full Claude Code process — a
+Node process — so memory multiplies alongside the tokens. On a claude.ai
+subscription that is a plausible way to hit rate limits, and nothing in the
+proxy can amortise the repeated prompt.
+
+It is one environment variable, so treat the default as a starting point.
+Set `CLAUDE_MAX_CONCURRENCY=1` to restore the old fully serialised behaviour,
+drop it to 2 if the token burst or your rate limits are the binding constraint,
+and raise it only if you have measured headroom. Watch the
+`cli-proxy agents running: N/M` line on the proxy console to see whether you
+are actually saturating the slots you have.
 
 ### About the debug dumps
 
@@ -472,7 +511,7 @@ output:
 ```json
 {
   "status": "ok",
-  "proxy_version": "0.1.0",
+  "proxy_version": "1.2.0",
   "claude_executable": "/opt/homebrew/bin/claude",
   "claude_executable_available": true,
   "claude_version": "2.1.231 (Claude Code)",
@@ -484,13 +523,18 @@ output:
     "claude-cli-sonnet",
     "claude-cli-opus"
   ],
-  "max_concurrency": 1,
+  "max_concurrency": 4,
+  "agents_running": 0,
   "timeout_seconds": 600.0,
   "streaming": "buffered",
   "stream_opens_immediately": true,
   "debug_dump": false
 }
 ```
+
+`agents_running` is how many Claude CLI processes are executing at that instant,
+out of `max_concurrency`; the same number is printed to the proxy console
+(`cli-proxy agents running: N/M`) whenever it changes.
 
 `debug_dump` is a boolean only — the dump directory path is deliberately kept out
 of an unauthenticated endpoint. Each call runs `claude --version` and `claude
@@ -561,8 +605,8 @@ later failure is reported **in band**: for Chat Completions a `finish_reason:
 Responses a `response.failed` event followed by `data: [DONE]`. Failures detected
 *before* the stream opens still return an ordinary HTTP 4xx/5xx JSON error.
 
-If the client disconnects mid-request, the Claude subprocess is cancelled and
-reaped (SIGTERM, 5 s, SIGKILL).
+If the client disconnects mid-request, the Claude invocation is cancelled and
+its whole process group is reaped (SIGTERM, 5 s, SIGKILL).
 
 ---
 
@@ -796,6 +840,34 @@ decision, a tool-result round trip, and image acceptance. It reads `.env` if
    `Authorization: Bearer <token>`.
 5. Verify and enable the override, then use the Agent panel as normal.
 
+### Cursor `/multitask`
+
+`/multitask` in the Agents Window opens several independent
+`POST /v1/chat/completions` (or Responses) requests at once. The proxy gives
+each one its own `claude --print` process group, up to `CLAUDE_MAX_CONCURRENCY`
+(default 4 — see [why the default is four](#why-the-concurrency-default-is-four)).
+Watch the proxy console:
+
+```
+cli-proxy agents running: 3/4
+```
+
+When an agent finishes, times out, is disconnected, or is replaced, its process
+group is SIGTERMed (then SIGKILLed after 5 s if needed) and the count drops.
+
+If you change the prompt on an agent that is still running, Cursor sends a new
+request with the same earlier turns and a different last user message. The proxy
+kills that agent's current Claude process and starts a new one with the updated
+prompt; the superseded request fails with HTTP 409 and the replacement carries
+the answer. Two `/multitask` siblings (different conversations) are not treated
+as edits and stay running. A brand-new first message is also not auto-replaced,
+so two first-turn siblings do not cancel each other; a first-message edit relies
+on Cursor aborting the old HTTP stream.
+
+Set `CLAUDE_MAX_CONCURRENCY` lower (even 1) if you want to serialise again.
+Raising it above 4 is allowed; each extra slot is another full Claude invocation
+and another copy of the prompt tokens.
+
 ### The model picker does not select the model
 
 Cursor sends **its own** model name in the request body — the observed value was
@@ -971,7 +1043,7 @@ Every client-facing error is an OpenAI-shaped body:
 | 502 "The model reported that it could not serve the request" | Claude used the contract's `error` shape — for example the conversation is contradictory, or it needs a tool Cursor did not offer. | `UpstreamModelError` / **502** | The message carries Claude's reason. Usually a prompt problem, not a proxy problem. |
 | 502 "The Claude Code CLI exited unsuccessfully" | Non-zero exit, or an envelope with `is_error`. stderr is classified but never echoed, so it will not appear in the response. | `ClaudeProcessError` / **502** | Run the same prompt through `claude --print` by hand. Raise `CLI_PROXY_LOG_LEVEL` to `DEBUG`. |
 | 502 "The Claude Code CLI is not authenticated" | The CLI reported an auth failure — logged out, or an expired OAuth token. Note this is **502**, not 503. | `ClaudeAuthError` / **502** | `claude auth status`, then sign in again. Confirm with `curl -s localhost:8787/health \| jq .claude_authenticated`. |
-| 504 "did not finish before the configured timeout" | The invocation exceeded `CLAUDE_TIMEOUT_SECONDS` (default 600). The subprocess is SIGTERMed, given 5 s, then SIGKILLed. | `ClaudeTimeoutError` / **504** | Raise `CLAUDE_TIMEOUT_SECONDS`, and raise the tunnel's timeouts to match. Recurrent timeouts usually mean the conversation has grown very large. |
+| 504 "did not finish before the configured timeout" | The invocation exceeded `CLAUDE_TIMEOUT_SECONDS` (default 600). The process group is SIGTERMed, given 5 s, then SIGKILLed. | `ClaudeTimeoutError` / **504** | Raise `CLAUDE_TIMEOUT_SECONDS`, and raise the tunnel's timeouts to match. Recurrent timeouts usually mean the conversation has grown very large. |
 | 502 "produced more output than the configured limit" | CLI stdout exceeded `CLI_PROXY_MAX_RESPONSE_BYTES` (default 4 MiB). | `ResponseTooLargeError` / **502** | Raise the limit, or ask for a shorter answer. |
 | 413 "Request body exceeds the configured maximum size" | Request over `CLI_PROXY_MAX_REQUEST_BYTES` (default 4 MiB). Long agent sessions do reach this. | `RequestTooLargeError` / **413** | Raise the limit, or start a fresh conversation in Cursor. |
 | 400 "accepts text and images; audio and file inputs are not supported" | An `input_audio` / `audio` / `input_file` / `file` / `file_url` content part. | `UnsupportedContentError` / **400** | Send text or an image. Audio and generic files are out of scope. |
@@ -980,6 +1052,9 @@ Every client-facing error is an OpenAI-shaped body:
 | Startup exits immediately with "cli-proxy configuration error: ..." | Bad environment: missing/short/placeholder token, invalid log level, out-of-range port, a non-numeric value, or `CLAUDE_WORKING_DIR` pointing at something that is not a directory. | `ConfigError`, exit code 2 | The message names the variable. |
 | `/health` returns 503 with `"status": "degraded"` | `claude_executable_available` or `claude_authenticated` is false. `detail` says which. | not a `ProxyError` | Fix per the rows above. This 503 is a health verdict, not a request failure. |
 | Proxy log lines read `[redacted by cli-proxy]` | The redaction filter matched something authorization-like or a long hex run in the message. | — | Working as designed. Use a debug dump if you need the detail. |
+| `/multitask` agents queue instead of overlapping | `CLAUDE_MAX_CONCURRENCY` is 1, or lower than the number of subagents Cursor dispatched. | — | Raise it in `.env` and restart. Confirm with the `cli-proxy agents running: N/M` console line and with `/health`'s `max_concurrency` and `agents_running`. |
+| 409 "This request was superseded by a newer prompt for the same conversation" | You edited the prompt on a conversation that still had a Claude invocation in flight; the proxy killed it and started a new one. | `AgentSupersededError` / **409** | Expected behaviour, not a fault. The replacement request carries the answer. |
+| `agents running` stays non-zero while Cursor is idle | A subprocess did not exit. | — | Check the log for the matching `cancelled; process reaped`, timeout, or supersede line. A pid stuck for minutes is a bug worth reporting; restarting the proxy clears it. |
 
 ### Turning on debug dumps for an investigation
 

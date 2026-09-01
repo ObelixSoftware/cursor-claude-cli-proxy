@@ -18,6 +18,7 @@ Modes (``FAKE_CLAUDE_MODE``):
 ``auth_fail``     exit non-zero with auth-flavoured stderr
 ``oversized``     emit a very large result string
 ``hang``          sleep far longer than any test timeout
+``hang_with_child`` as ``hang``, but first spawn a grandchild that also sleeps
 ``schema_break``  succeed with structured output that violates the contract
 
 ``FAKE_CLAUDE_DELAY_SECONDS`` delays the reply in every mode, which is how the
@@ -28,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -200,6 +202,17 @@ def main() -> int:
         time.sleep(delay)
 
     if mode == "hang":
+        time.sleep(600)
+        return 0
+
+    if mode == "hang_with_child":
+        # Spawns a grandchild that outlives a signal aimed at this process
+        # alone, so the tests can prove the whole process group is reaped.
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+        pid_path = os.environ.get("FAKE_CLAUDE_CHILD_PID_FILE")
+        if pid_path:
+            with open(pid_path, "w", encoding="utf-8") as handle:
+                handle.write(str(child.pid))
         time.sleep(600)
         return 0
 

@@ -45,7 +45,9 @@ from .images import ImageAttachment
 from .normalize import (
     FLAVOR_CHAT,
     FLAVOR_RESPONSES,
+    ConversationIdentity,
     NormalizedRequest,
+    derive_conversation_identity,
     normalize_request,
     serialize_prompt,
 )
@@ -178,6 +180,7 @@ async def _stream_exchange(
     builder: StreamBuilder,
     exchange: Exchange,
     images: list[ImageAttachment] | None = None,
+    identity: ConversationIdentity | None = None,
 ) -> AsyncIterator[str]:
     """Drive one streaming request.
 
@@ -186,7 +189,9 @@ async def _stream_exchange(
     the gap until the answer is ready. Once the stream is open an HTTP error
     status is no longer available, so failures are reported in band.
     """
-    work = asyncio.ensure_future(runner.run(prompt, model_alias, exchange, images))
+    work = asyncio.ensure_future(
+        runner.run(prompt, model_alias, exchange, images, identity)
+    )
     _keep_until_done(work)
     watcher = asyncio.ensure_future(_watch_for_disconnect(request))
 
@@ -278,6 +283,10 @@ def create_app(
     app.state.runner = runner or ClaudeRunner(resolved, load_adapter_system_prompt())
     app.state.dumper = DebugDumper(resolved)
 
+    # Print the count once at startup so the console always shows a total,
+    # rather than staying silent until the first request arrives.
+    app.state.runner.log_agent_count()
+
     if app.state.dumper.enabled:
         _LOG.warning(
             "DEBUG DUMP IS ON: full request and response bodies are being "
@@ -316,6 +325,7 @@ def create_app(
             "default_model_alias": cfg.default_model_alias,
             "models": list(cfg.advertised_models),
             "max_concurrency": cfg.max_concurrency,
+            "agents_running": active.agents_running,
             "timeout_seconds": cfg.timeout_seconds,
             # The content is still delivered in one burst, but the event stream
             # itself opens before Claude is invoked.
@@ -427,6 +437,10 @@ def create_app(
             prompt = serialize_prompt(normalized, model_alias)
             exchange.record_prompt(prompt)
 
+            # Names the conversation so that a later request carrying an edited
+            # prompt replaces this invocation instead of racing it.
+            identity = derive_conversation_identity(body, normalized)
+
             # Response shape follows the *payload* shape, so a Responses-style
             # body posted to /v1/chat/completions gets a Responses-style reply.
             # This holds for the streaming path as much as the buffered one.
@@ -452,13 +466,15 @@ def create_app(
                         builder=builder,
                         exchange=exchange,
                         images=attachments,
+                        identity=identity,
                     ),
                     media_type="text/event-stream",
                     headers=_SSE_HEADERS,
                 )
 
             decision = await _run_guarded(
-                request, active.run(prompt, model_alias, exchange, attachments)
+                request,
+                active.run(prompt, model_alias, exchange, attachments, identity),
             )
 
             if decision.kind == KIND_ERROR:

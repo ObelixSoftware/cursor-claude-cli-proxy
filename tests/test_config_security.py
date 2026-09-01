@@ -55,7 +55,7 @@ def test_defaults_bind_to_loopback(monkeypatch: pytest.MonkeyPatch):
     assert resolved.host == "127.0.0.1"
     assert resolved.port == 8787
     assert resolved.timeout_seconds == 600.0
-    assert resolved.max_concurrency == 1
+    assert resolved.max_concurrency == 4
 
 
 def test_invalid_numeric_env_is_rejected(monkeypatch: pytest.MonkeyPatch):

@@ -118,6 +118,20 @@ class ClientDisconnectedError(ProxyError):
     client_message = "The client disconnected before the response was produced."
 
 
+class AgentSupersededError(ProxyError):
+    """A newer request for the same conversation replaced this one.
+
+    ``claude --print`` cannot be handed a new prompt mid-run, so an edited
+    prompt is applied by killing this invocation and starting another.
+    """
+
+    status_code = 409
+    error_type = "api_error"
+    client_message = (
+        "This request was superseded by a newer prompt for the same conversation."
+    )
+
+
 class UpstreamModelError(ProxyError):
     """Claude itself reported a structured error via the output contract."""
 

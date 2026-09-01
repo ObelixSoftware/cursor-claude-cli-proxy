@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -47,6 +48,14 @@ class ImageAttachment:
             nbytes = (len(self.data) * 3) // 4
             return f"{self.media_type}, {nbytes} bytes"
         return self.url or "image"
+
+    def digest(self) -> str:
+        """Stable, non-reversible identifier used to fingerprint a turn."""
+        hasher = hashlib.sha256()
+        hasher.update(self.media_type.encode("utf-8", errors="replace"))
+        hasher.update(b"\x1e")
+        hasher.update((self.data or self.url or "").encode("utf-8", errors="replace"))
+        return hasher.hexdigest()[:16]
 
     def to_content_block(self) -> dict[str, Any]:
         if self.data is not None:

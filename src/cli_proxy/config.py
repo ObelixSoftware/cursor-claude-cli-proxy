@@ -18,7 +18,10 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
 DEFAULT_MODEL_ALIAS = "sonnet"
 DEFAULT_TIMEOUT_SECONDS = 600.0
-DEFAULT_MAX_CONCURRENCY = 1
+#: Cursor's ``/multitask`` fans one turn out into several concurrent requests.
+#: Four slots lets a typical fan-out run in parallel; each one is a full process
+#: launch that re-pays the whole prompt, so this is not free.
+DEFAULT_MAX_CONCURRENCY = 4
 DEFAULT_MAX_REQUEST_BYTES = 4 * 1024 * 1024
 DEFAULT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 DEFAULT_LOG_LEVEL = "INFO"

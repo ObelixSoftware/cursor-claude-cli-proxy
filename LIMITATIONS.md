@@ -120,9 +120,23 @@ has not been automatically verified and needs a human to confirm.
 
 ## 5. Other operational limits
 
-* **One request at a time by default.** `CLAUDE_MAX_CONCURRENCY` defaults to 1.
-  A second request queues behind the first. Each Claude invocation is a full
-  process launch, so raising this multiplies memory and token cost.
+* **Up to N concurrent CLI processes (default 4).**
+  `CLAUDE_MAX_CONCURRENCY` defaults to 4 so Cursor `/multitask` can run
+  several agents at once. Further requests wait on the semaphore. Each
+  invocation is a full process-group launch, so raising this multiplies
+  memory and token cost. The console prints `cli-proxy agents running: N/M`
+  on every change. When an agent finishes, is cancelled, times out, or is
+  superseded, the proxy signals the whole process group (SIGTERM, 5 s,
+  SIGKILL) so child processes do not leak. The reasoning behind the default
+  of 4 is written out in the README, under "Why the concurrency default is
+  four" in §6.
+* **A prompt edit cannot be injected into a running `claude --print`.**
+  That command reads stdin once. If a later request has the same
+  conversation prefix and a different last user message, the in-flight
+  process group is killed and a new invocation starts with the updated
+  prompt. Brand-new first messages are not matched this way, so two
+  first-turn `/multitask` siblings do not cancel each other. First-message
+  edits depend on the editor aborting the previous HTTP stream.
 * **No conversation reuse.** `--continue` and `--resume` are never used and
   session persistence is off, so every request re-sends the whole conversation
   and re-pays for the prompt tokens.

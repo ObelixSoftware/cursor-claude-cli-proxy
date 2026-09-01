@@ -5,6 +5,6 @@ and never touches the filesystem on the model's behalf; the calling editor
 stays responsible for all tool execution and file changes.
 """
 
-__version__ = "0.1.0"
+__version__ = "1.2.0"
 
 __all__ = ["__version__"]
